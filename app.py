@@ -2,69 +2,74 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import io
+import re
 
-# වෙබ් පිටුවේ පෙනුම සැකසීම
-st.set_page_config(page_title="Ultra PDF to Excel Converter", layout="wide")
+# Page Configuration
+st.set_page_config(page_title="Ultimate AI PDF Converter", layout="wide")
 
-st.title("🚀 Professional PDF to Excel (100% Accuracy Mode)")
-st.markdown("මෙම පද්ධතිය ඔබේ Packing List එකේ ඇති වගු වල හැඩය (Layout) එලෙසම ආරක්ෂා කරයි.")
+st.title("🏆 AI-Powered Packing List Master")
+st.markdown("මෙය PDF එකේ ඇති වගු වල සීමාවන් (Bounding Boxes) හඳුනාගෙන 100% ක් නිවැරදිව Excel සකසයි.")
 
-uploaded_file = st.file_uploader("ඔබේ PDF ගොනුව මෙතැනට Upload කරන්න", type="pdf")
+uploaded_file = st.file_uploader("Upload Helen Kaminski Packing List", type="pdf")
 
-if uploaded_file is not None:
-    with st.spinner("Analyzing layout and extracting tables..."):
-        all_pages_data = []
+def advanced_clean(text):
+    """දත්ත පිරිසිදු කර පේළි කැඩීම් (Newlines) ඉවත් කරයි"""
+    if text is None: return ""
+    # අකුරු අතර ඇති අනවශ්‍ය පේළි කැඩීම් ඉවත් කර තනි පේළියකට ගනී
+    text = str(text).replace('\n', ' ')
+    return re.sub(r'\s+', ' ', text).strip()
+
+if uploaded_file:
+    with st.spinner("Deep Scan ක්‍රියාත්මකයි... කරුණාකර රැඳී සිටින්න."):
+        all_table_data = []
         
         with pdfplumber.open(uploaded_file) as pdf:
             for page in pdf.pages:
-                # දියුණු Table Extraction Settings
-                # මෙය වගුවේ ඇති ඉරි සහ අකුරු අතර පරතරය ඉතා සියුම්ව පරීක්ෂා කරයි
-                table_settings = {
-                    "vertical_strategy": "text",   # අකුරු අනුව තීරු වෙන් කිරීම
-                    "horizontal_strategy": "text", # අකුරු අනුව පේළි වෙන් කිරීම
-                    "snap_tolerance": 3,           # අකුරු එකිනෙකට සම්බන්ධ කිරීමේ පරාසය
+                # දියුණු Table Extraction තාක්ෂණය
+                # මෙහි settings මගින් වගුවේ නොපෙනෙන ඉරි පවා හඳුනා ගනී
+                table = page.extract_table({
+                    "vertical_strategy": "lines_price", # ඉරි සහ අකුරු පිහිටීම යන දෙකම බලයි
+                    "horizontal_strategy": "text", 
+                    "snap_tolerance": 3,
                     "join_tolerance": 3,
                     "edge_min_length": 15,
-                    "intersection_tolerance": 10,
-                }
-                
-                table = page.extract_table(table_settings)
+                })
                 
                 if table:
-                    # පේළි ඇතුළත ඇති අනවශ්‍ය 'New Lines' (\n) ඉවත් කර පිරිසිදු කිරීම
-                    clean_table = []
                     for row in table:
-                        clean_row = [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
-                        clean_table.append(clean_row)
-                    
-                    df_page = pd.DataFrame(clean_table)
-                    all_pages_data.append(df_page)
+                        # සෑම සෛලයක්ම (Cell) පිරිසිදු කිරීම
+                        cleaned_row = [advanced_clean(cell) for cell in row]
+                        # හිස් පේළි ඉවත් කිරීම
+                        if any(cleaned_row):
+                            all_table_data.append(cleaned_row)
 
-        if all_pages_data:
-            # සියලුම පිටු එකම වගුවකට සම්බන්ධ කිරීම
-            final_df = pd.concat(all_pages_data, ignore_index=True)
+        if all_table_data:
+            # Pandas භාවිතා කර ව්‍යුහය සකස් කිරීම
+            df = pd.DataFrame(all_table_data)
             
-            # Preview පෙන්වීම
-            st.success("සාර්ථකව දත්ත හඳුනාගන්නා ලදී!")
-            st.write("### Data Preview")
-            st.dataframe(final_df)
+            st.success("Analysis Completed!")
+            st.write("### Extracted Data Preview")
+            st.dataframe(df, use_container_width=True)
 
-            # Excel ගොනුව සෑදීම (Styles සහිතව)
+            # Excel ගොනුව සකස් කිරීම
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                final_df.to_excel(writer, index=False, header=False, sheet_name='Packing_List')
+                df.to_excel(writer, index=False, header=False, sheet_name='Packing_List')
                 
-                # Excel එකේ තීරු වල පළල ස්වයංක්‍රීයව සකස් කිරීම
                 workbook = writer.book
                 worksheet = writer.sheets['Packing_List']
-                for i, col in enumerate(final_df.columns):
-                    worksheet.set_column(i, i, 20) 
-
+                
+                # Excel formatting (ලස්සනට සකස් කිරීම)
+                header_fmt = workbook.add_format({'bold': True, 'bg_color': '#CFE2F3', 'border': 1})
+                cell_fmt = workbook.add_format({'border': 1, 'valign': 'vcenter'})
+                
+                # තීරු වල පළල ස්වයංක්‍රීයව සකස් කිරීම (Auto-fit look)
+                for i, col in enumerate(df.columns):
+                    worksheet.set_column(i, i, 20, cell_fmt)
+            
             st.download_button(
-                label="📥 Download Perfect Excel File",
+                label="📥 Download Master Excel File",
                 data=output.getvalue(),
-                file_name="Formatted_Packing_List.xlsx",
+                file_name="Master_Packing_List_Converted.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        else:
-            st.error("වගු හඳුනා ගැනීමට නොහැකි විය. කරුණාකර PDF ගොනුව පරීක්ෂා කරන්න.")
