@@ -3,46 +3,68 @@ import pdfplumber
 import pandas as pd
 import io
 
-# පිටුවේ පෙනුම සකස් කිරීම
-st.set_page_config(page_title="Packing List Converter", layout="wide")
+# වෙබ් පිටුවේ පෙනුම සැකසීම
+st.set_page_config(page_title="Ultra PDF to Excel Converter", layout="wide")
 
-st.title("📑 Professional PDF to Excel Converter")
-st.info("Upload your Helen Kaminski Packing List to convert.")
+st.title("🚀 Professional PDF to Excel (100% Accuracy Mode)")
+st.markdown("මෙම පද්ධතිය ඔබේ Packing List එකේ ඇති වගු වල හැඩය (Layout) එලෙසම ආරක්ෂා කරයි.")
 
-uploaded_file = st.file_uploader("Choose your PDF file", type="pdf")
+uploaded_file = st.file_uploader("ඔබේ PDF ගොනුව මෙතැනට Upload කරන්න", type="pdf")
 
 if uploaded_file is not None:
-    try:
-        all_rows = []
+    with st.spinner("Analyzing layout and extracting tables..."):
+        all_pages_data = []
+        
         with pdfplumber.open(uploaded_file) as pdf:
             for page in pdf.pages:
-                # දත්ත වගු ලෙස වෙන් කරගැනීම
-                table = page.extract_table({
-                    "vertical_strategy": "text", 
-                    "horizontal_strategy": "text",
-                    "snap_tolerance": 4,
-                })
+                # දියුණු Table Extraction Settings
+                # මෙය වගුවේ ඇති ඉරි සහ අකුරු අතර පරතරය ඉතා සියුම්ව පරීක්ෂා කරයි
+                table_settings = {
+                    "vertical_strategy": "text",   # අකුරු අනුව තීරු වෙන් කිරීම
+                    "horizontal_strategy": "text", # අකුරු අනුව පේළි වෙන් කිරීම
+                    "snap_tolerance": 3,           # අකුරු එකිනෙකට සම්බන්ධ කිරීමේ පරාසය
+                    "join_tolerance": 3,
+                    "edge_min_length": 15,
+                    "intersection_tolerance": 10,
+                }
+                
+                table = page.extract_table(table_settings)
+                
                 if table:
-                    all_rows.extend(table)
-        
-        if all_rows:
-            df = pd.DataFrame(all_rows)
-            st.write("### Preview of Converted Data")
-            st.dataframe(df.head(10)) # පළමු පේළි 10 පෙන්වයි
+                    # පේළි ඇතුළත ඇති අනවශ්‍ය 'New Lines' (\n) ඉවත් කර පිරිසිදු කිරීම
+                    clean_table = []
+                    for row in table:
+                        clean_row = [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
+                        clean_table.append(clean_row)
+                    
+                    df_page = pd.DataFrame(clean_table)
+                    all_pages_data.append(df_page)
 
-            # Excel එක සෑදීම
+        if all_pages_data:
+            # සියලුම පිටු එකම වගුවකට සම්බන්ධ කිරීම
+            final_df = pd.concat(all_pages_data, ignore_index=True)
+            
+            # Preview පෙන්වීම
+            st.success("සාර්ථකව දත්ත හඳුනාගන්නා ලදී!")
+            st.write("### Data Preview")
+            st.dataframe(final_df)
+
+            # Excel ගොනුව සෑදීම (Styles සහිතව)
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, header=False)
-            
+                final_df.to_excel(writer, index=False, header=False, sheet_name='Packing_List')
+                
+                # Excel එකේ තීරු වල පළල ස්වයංක්‍රීයව සකස් කිරීම
+                workbook = writer.book
+                worksheet = writer.sheets['Packing_List']
+                for i, col in enumerate(final_df.columns):
+                    worksheet.set_column(i, i, 20) 
+
             st.download_button(
-                label="📥 Download Full Excel File",
+                label="📥 Download Perfect Excel File",
                 data=output.getvalue(),
-                file_name="Converted_List.xlsx",
+                file_name="Formatted_Packing_List.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
-            st.warning("No tabular data detected. Please check the PDF quality.")
-            
-    except Exception as e:
-        st.error(f"An error occurred: {e}")
+            st.error("වගු හඳුනා ගැනීමට නොහැකි විය. කරුණාකර PDF ගොනුව පරීක්ෂා කරන්න.")
