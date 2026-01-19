@@ -4,62 +4,76 @@ import pandas as pd
 import io
 import re
 
-st.set_page_config(page_title="AI PDF to Excel Master", layout="wide")
+st.set_page_config(page_title="Shipping Label to Excel", layout="wide")
 
-st.title("📊 AI-Driven Packing List Converter")
-st.markdown("මෙම පද්ධතිය Helen Kaminski Packing List වැනි සංකීර්ණ ලේඛන සඳහාම විශේෂිතව නිපදවා ඇත.")
+st.title("📦 Shipping Label Data Extractor")
+st.markdown("Brandix/Amazon Label වැනි ලේඛන වලින් දත්ත නිවැරදිව Excel වලට ලබා ගැනීමට මෙය භාවිතා කරන්න.")
 
-uploaded_file = st.file_uploader("ඔබේ PDF ගොනුව මෙතැනට Upload කරන්න", type="pdf")
+uploaded_file = st.file_uploader("ලේබල් සහිත PDF ගොනුව Upload කරන්න", type="pdf")
 
-def smart_clean(text):
-    if text is None: return ""
-    # පේළි කැඩීම් සහ අනවශ්‍ය හිස්තැන් ඉවත් කර තනි පේළියකට ගනී
-    return re.sub(r'\s+', ' ', str(text)).strip()
+def extract_label_data(text):
+    """PDF පෙළෙහි ඇති දත්ත Regex මගින් වෙන් කර හඳුනා ගනී"""
+    data = {}
+    
+    # එක් එක් දත්ත ක්ෂේත්‍රය හඳුනා ගැනීමට patterns භාවිතා කිරීම
+    data['PO#'] = re.search(r'PO#:\s*(.*)', text)
+    data['STYLE#'] = re.search(r'STYLE#:\s*(.*)', text)
+    data['ITEM DESC'] = re.search(r'ITEM DESC:\s*(.*?)(?=ASIN#|UPC:|$)', text, re.DOTALL)
+    data['ASIN#'] = re.search(r'ASIN#:\s*(.*)', text)
+    data['UPC'] = re.search(r'UPC:\s*(.*)', text)
+    data['QTY'] = re.search(r'QTY:\s*(\d+)', text)
+    data['CARTON#'] = re.search(r'CARTON#:\s*(.*)', text)
+    data['Country of Origin'] = re.search(r'Country Of Origin\s*(.*)', text)
+    
+    # SSCC Barcode අංකය (පහළ ඇති දිගු අංකය)
+    sscc_match = re.search(r'(\d{18,20})$', text.strip())
+    data['SSCC'] = sscc_match.group(1) if sscc_match else ""
+
+    # දත්ත පිරිසිදු කර නිවැරදි අගය පමණක් ලබා ගැනීම
+    return {k: (v.group(1).strip() if hasattr(v, 'group') and v else "") for k, v in data.items()}
 
 if uploaded_file is not None:
     try:
-        with st.spinner("දත්ත විශ්ලේෂණය කරමින් පවතී..."):
-            all_data = []
+        with st.spinner("ලේබල් කියවමින් පවතී..."):
+            all_labels = []
             
             with pdfplumber.open(uploaded_file) as pdf:
                 for page in pdf.pages:
-                    # 'Lattice' තාක්ෂණය: වගුවේ නොපෙනෙන කෝෂ (Cells) හඳුනා ගනී
-                    table = page.extract_table({
-                        "vertical_strategy": "text",
-                        "horizontal_strategy": "text",
-                        "snap_tolerance": 5,
-                        "join_tolerance": 5,
-                    })
-                    
-                    if table:
-                        for row in table:
-                            # සෑම සෛලයක්ම පිරිසිදු කිරීම
-                            cleaned_row = [smart_clean(cell) for cell in row]
-                            if any(cleaned_row): # හිස් පේළි ඉවත් කිරීම
-                                all_data.append(cleaned_row)
+                    # මුළු පිටුවේම ඇති Text එක ලබා ගැනීම
+                    text = page.extract_text()
+                    if text:
+                        label_info = extract_label_data(text)
+                        all_labels.append(label_info)
 
-            if all_data:
-                df = pd.DataFrame(all_data)
+            if all_labels:
+                df = pd.DataFrame(all_labels)
                 
-                # Excel formatting සහ Download බටන් එක
-                st.success("සාර්ථකයි!")
+                # පෙනුම සැකසීම
+                st.success(f"ලේබල් {len(all_labels)} ක් සාර්ථකව හඳුනා ගන්නා ලදී!")
                 st.dataframe(df, use_container_width=True)
 
+                # Excel එක සෑදීම
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    df.to_excel(writer, index=False, header=False, sheet_name='Data')
+                    df.to_excel(writer, index=False, sheet_name='Labels')
                     
-                    # තීරු වල පළල ස්වයංක්‍රීයව සැකසීම
-                    worksheet = writer.sheets['Data']
-                    for i, _ in enumerate(df.columns):
-                        worksheet.set_column(i, i, 22)
+                    # Excel Formatting
+                    workbook = writer.book
+                    worksheet = writer.sheets['Labels']
+                    header_format = workbook.add_format({'bold': True, 'bg_color': '#D7E4BC', 'border': 1})
+                    
+                    for col_num, value in enumerate(df.columns.values):
+                        worksheet.write(0, col_num, value, header_format)
+                        worksheet.set_column(col_num, col_num, 20)
 
                 st.download_button(
-                    label="📥 Download Master Excel File",
+                    label="📥 Download Excel File",
                     data=output.getvalue(),
-                    file_name="Converted_Packing_List.xlsx",
+                    file_name="Label_Data.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+            else:
+                st.warning("කිසිදු දත්තයක් හඳුනා ගැනීමට නොහැකි විය. කරුණාකර PDF එකේ ගුණාත්මකභාවය පරීක්ෂා කරන්න.")
+
     except Exception as e:
-        st.error(f"Error එකක් සිදු විය: {str(e)}")
-        st.info("කරුණාකර requirements.txt ගොනුව නිවැරදි දැයි පරීක්ෂා කරන්න.")
+        st.error(f"දෝෂයක් සිදුවිය: {e}")
