@@ -149,7 +149,7 @@ def merge_sscc_groups(df):
     """
     Merge rows that share the same SSCC (= same physical carton with multiple sizes).
     - Size      → "L/S/XS"
-    - Size Detail → "L:18/S:18/XS:6"
+    - Size Detail → "L18/S18/XS6"
     - Quantity  → sum of all sizes
     Single-size cartons pass through unchanged (Size Detail left empty).
     """
@@ -158,7 +158,7 @@ def merge_sscc_groups(df):
         if len(group) > 1:
             first["Size"]        = "/".join(group["Size"].tolist())
             first["Size Detail"] = "/".join(
-                f'{r["Size"]}:{r["Quantity"]}' for _, r in group.iterrows()
+                f'{r["Size"]}{r["Quantity"]}' for _, r in group.iterrows()
             )
             first["Quantity"]    = str(sum(
                 int(q) for q in group["Quantity"] if str(q).isdigit()
@@ -221,6 +221,9 @@ if uploaded_file is not None:
                     if col not in df.columns:
                         df[col] = ""
                 df = df[COLUMN_ORDER]
+
+                # Convert all columns to str to avoid int64 serialization errors
+                df = df.astype(str).replace("nan", "")
 
                 total_labels = df["Carton No."].nunique()
                 st.success(
