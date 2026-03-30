@@ -88,7 +88,7 @@ def extract_label_data(text):
     if sscc_raw_match:
         raw          = sscc_raw_match.group(0).split('\n')[0].strip()
         sscc_display = raw
-        sscc_digits  = re.sub(r'[^\d]', '', raw)
+        sscc_digits  = re.sub(r'[^\d]', '', raw)[:20]
     else:
         sscc_display = sscc_digits = ""
 
