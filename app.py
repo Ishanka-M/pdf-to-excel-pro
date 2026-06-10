@@ -130,6 +130,7 @@ def parse_carton_label(text, page_no):
             break
     carton_full = " ".join(filter(None, [prefix, mid, seq, chk]))
     carton_seq  = (mid + seq) if (mid and seq) else seq      # running carton number
+    carton_code = re.sub(r'\D', '', carton_full)             # full barcode, no spaces
 
     # Description — tokens between the (second) carton prefix and the PO# token,
     # in reversed order ->  'HI-STR TECH SLIM 5 POCKET PANT'
@@ -157,13 +158,14 @@ def parse_carton_label(text, page_no):
         "GTIN (01)"     : gtin,
         "Carton No."    : carton_full,
         "Carton Seq"    : carton_seq,
+        "Carton Barcode": carton_code,
     }
 
 
 CARTON_COLUMN_ORDER = [
     "Label No.", "Ship To", "Date", "PO #",
     "Style / Color", "Description", "Color", "Size",
-    "Qty", "GTIN (01)", "Carton No.", "Carton Seq",
+    "Qty", "GTIN (01)", "Carton No.", "Carton Seq", "Carton Barcode",
 ]
 
 CARTON_COL_WIDTHS = {
@@ -179,6 +181,7 @@ CARTON_COL_WIDTHS = {
     "GTIN (01)"     : 18,
     "Carton No."    : 24,
     "Carton Seq"    : 13,
+    "Carton Barcode": 24,
 }
 
 
