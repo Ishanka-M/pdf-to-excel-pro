@@ -7,7 +7,7 @@ import re
 st.set_page_config(page_title="AI Shipping Label Extractor", layout="wide")
 
 st.title("📊 AI Shipping Label to Excel Converter")
-st.subheader("Developed by Lakshan")
+st.subheader("Developed by Ishanka_M")
 st.markdown("---")
 
 uploaded_file = st.file_uploader("ඔබේ PDF ලේබල් ගොනුව මෙතැනට Upload කරන්න", type="pdf")
