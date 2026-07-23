@@ -7,7 +7,7 @@ import re
 st.set_page_config(page_title="AI Shipping Label Extractor", layout="wide")
 
 st.title("📊 AI Shipping Label to Excel Converter")
-st.subheader("Developed by Ishanka Madusanka")
+st.subheader("Developed by Lakshan")
 st.markdown("---")
 
 uploaded_file = st.file_uploader("ඔබේ PDF ලේබල් ගොනුව මෙතැනට Upload කරන්න", type="pdf")
@@ -23,18 +23,12 @@ def clean_text(text):
 
 
 def reverse_lines(text):
-    """
-    Rotated / mirrored carton labels come out of pdfplumber with the characters
-    of every line reversed (the label is printed sideways). Reversing each line
-    restores readable tokens, e.g. 'ottemlaP' -> 'Palmetto'.
-    """
     if not text:
         return []
     return [line[::-1] for line in text.split('\n')]
 
 
 def gtin_check_digit(d13):
-    """Standard GS1 GTIN check digit (weights 3,1 from the right)."""
     total = 0
     for i, ch in enumerate(reversed(d13)):
         total += int(ch) * (3 if i % 2 == 0 else 1)
@@ -42,14 +36,11 @@ def gtin_check_digit(d13):
 
 
 def detect_format(text):
-    """
-    Decide which parser to use for a page.
-      - 'carton'  -> the rotated GS1 carton label (reversed text)
-      - 'cmus'    -> the CMUS / Club Monaco label
-      - None      -> unrecognised
-    """
     if not text:
         return None
+    # අලුත් format එක හඳුනාගැනීම (Unichela / McDonough ආදිය)
+    if "UNICHELA" in text or "NON-CONFORMING" in text or "MCDONOUGH" in text:
+        return "unichela"
     if "Material #" in text or "Ship From:" in text:
         return "cmus"
     rev = " ".join(reverse_lines(text))
@@ -59,36 +50,21 @@ def detect_format(text):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Parser 1 — Rotated GS1 carton label  (the new EDI / 4300187093_ub1 format)
+# Parser 1 — Rotated GS1 carton label
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_carton_label(text, page_no):
-    """
-    One carton per page. Extract the printed fields from the reversed text.
-
-    Visible fields on the label:
-      SHIP TO  : Palmetto DC / Palmetto GA
-      Date     : 7/13/2026
-      QTY      : 36
-      (01) ... : GTIN barcode
-      STYLE/COLOR / SIZE
-      PO#      : 4300187093
-      CARTON NO: 0000099617 125872 456 2
-    """
     lines = reverse_lines(text)
     joined = " ".join(lines)
 
-    # Ship To (two stacked lines around the SHIP TO: marker)
     m = re.search(r'(\w+)\s+(\w+)\s+TO:', joined)
     ship_name = f"{m.group(2)} {m.group(1)}" if m else ""
     m = re.search(r'Date:\s+(\w+)\s+(\w+)', joined)
     ship_loc = f"{m.group(2)} {m.group(1)}" if m else ""
     ship_to = ", ".join(filter(None, [ship_name, ship_loc]))
 
-    # Date
     m = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', joined)
     date = m.group(1) if m else ""
 
-    # Quantity — the integer printed just before the date token
     qty = ""
     for i, l in enumerate(lines):
         if re.fullmatch(r'\d{1,2}/\d{1,2}/\d{4}', l):
@@ -96,15 +72,12 @@ def parse_carton_label(text, page_no):
                 qty = lines[i - 1]
             break
 
-    # PO number
     m = re.search(r'PO#?\s*(\d{6,})', joined)
     po = m.group(1) if m else ""
 
-    # Style / Colour code (e.g. CRZ06312-036)
     m = re.search(r'([A-Z]{2,5}\d{3,}-\d+)', joined)
     style = m.group(1) if m else ""
 
-    # GTIN — reconstruct (01) + 11-digit body, append computed check digit
     gtin = ""
     m = re.search(r'\(01\)(\d+)', joined)
     if m:
@@ -114,12 +87,9 @@ def parse_carton_label(text, page_no):
             d13 = head + b.group(1)
             gtin = d13 + str(gtin_check_digit(d13))
 
-    # Colour & Size (printed plainly on the label)
     color = "Black" if "Black" in joined else ""
     size  = "Prepack" if "Prepack" in joined else ""
 
-    # Carton number block — anchored on the 'CARTON' token
-    #   layout (reversed lines):  <check> <seq> NO CARTON <mid> <prefix>
     prefix = mid = seq = chk = ""
     for i, l in enumerate(lines):
         if l == "CARTON":
@@ -129,11 +99,9 @@ def parse_carton_label(text, page_no):
             chk    = lines[i - 3] if i - 3 >= 0 else ""
             break
     carton_full = " ".join(filter(None, [prefix, mid, seq, chk]))
-    carton_seq  = (mid + seq) if (mid and seq) else seq      # running carton number
-    carton_code = re.sub(r'\D', '', carton_full)             # full barcode, no spaces
+    carton_seq  = (mid + seq) if (mid and seq) else seq 
+    carton_code = re.sub(r'\D', '', carton_full) 
 
-    # Description — tokens between the (second) carton prefix and the PO# token,
-    # in reversed order ->  'HI-STR TECH SLIM 5 POCKET PANT'
     desc = ""
     if prefix:
         idxs = [i for i, l in enumerate(lines) if l == prefix]
@@ -162,6 +130,66 @@ def parse_carton_label(text, page_no):
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Parser 2 — Bulk / Unichela label format
+# ─────────────────────────────────────────────────────────────────────────────
+def extract_unichela_labels(text, page_no):
+    """
+    BULK_1.pdf වැනි එකම පිටුවේ ලේබල් කිහිපයක් තිබිය හැකි format එක සඳහා
+    """
+    rows = []
+    parts = text.split("SHIP TO:")
+    
+    for part in parts[1:]:
+        cleaned = clean_text("SHIP TO: " + part)
+        
+        date_m = re.search(r'Date:\s*(\d{1,2}/\d{1,2}/\d{4})', cleaned)
+        date = date_m.group(1) if date_m else ""
+        
+        ship_m = re.search(r'Date:.*?\d{4}\s+(.*?)\s+QTY', cleaned)
+        ship_to = ship_m.group(1).strip() if ship_m else "MCDONOUGH GA MCDONOUGH DC"
+        
+        qty_m = re.search(r'QTY\s+(\d+)', cleaned)
+        qty = qty_m.group(1) if qty_m else ""
+        
+        po_m = re.search(r'PO#\s*(\d+)', cleaned)
+        po = po_m.group(1) if po_m else ""
+        
+        # Style / Size හඳුනාගැනීම
+        style, size = "", ""
+        style_size_m = re.search(r'\b(XXS|XS|S|M|L|XL|XXL|\d+[SML]?)\s+([A-Z0-9]+(?:\s*-\s*[A-Z0-9]+)+)', cleaned)
+        if style_size_m:
+            size = style_size_m.group(1)
+            style = style_size_m.group(2)
+            
+        # Barcode අංකය හඳුනාගැනීම (දිගු ඉලක්කම් පෙළ)
+        barcode = ""
+        b_match = re.search(r'QTY\s+\d+\s+([\d\s]{15,})\s+CARTON', cleaned)
+        if b_match:
+            barcode = b_match.group(1).replace(" ", "")
+        else:
+            numbers = re.findall(r'\d{12,}', cleaned.replace(" ", ""))
+            if numbers:
+                barcode = max(numbers, key=len)
+                
+        rows.append({
+            "Label No."     : page_no,
+            "Ship To"       : ship_to,
+            "Date"          : date,
+            "PO #"          : po,
+            "Style / Color" : style,
+            "Description"   : "UNICHELA / NON-CONFORMING",
+            "Color"         : "",
+            "Size"          : size,
+            "Qty"           : qty,
+            "GTIN (01)"     : "",
+            "Carton No."    : barcode,
+            "Carton Seq"    : "",
+            "Carton Barcode": barcode,
+        })
+    return rows
+
+
 CARTON_COLUMN_ORDER = [
     "Label No.", "Ship To", "Date", "PO #",
     "Style / Color", "Description", "Color", "Size",
@@ -169,24 +197,16 @@ CARTON_COLUMN_ORDER = [
 ]
 
 CARTON_COL_WIDTHS = {
-    "Label No."     : 9,
-    "Ship To"       : 28,
-    "Date"          : 12,
-    "PO #"          : 14,
-    "Style / Color" : 16,
-    "Description"   : 32,
-    "Color"         : 10,
-    "Size"          : 10,
-    "Qty"           : 8,
-    "GTIN (01)"     : 18,
-    "Carton No."    : 24,
-    "Carton Seq"    : 13,
+    "Label No."     : 9,  "Ship To"       : 28, "Date"          : 12,
+    "PO #"          : 14, "Style / Color" : 16, "Description"   : 32,
+    "Color"         : 10, "Size"          : 10, "Qty"           : 8,
+    "GTIN (01)"     : 18, "Carton No."    : 24, "Carton Seq"    : 13,
     "Carton Barcode": 24,
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Parser 2 — CMUS / Club Monaco label  (original format, kept for back-compat)
+# Parser 3 — CMUS / Club Monaco label
 # ─────────────────────────────────────────────────────────────────────────────
 def extract_label_data(text):
     rows = []
@@ -235,10 +255,7 @@ def extract_label_data(text):
     else:
         sscc_display = sscc_digits = ""
 
-    table_match = re.search(
-        r'Material\s*#\s+Size\s+Quantity\s*\n(.*?)LABEL TOTAL',
-        text, re.DOTALL | re.IGNORECASE
-    )
+    table_match = re.search(r'Material\s*#\s+Size\s+Quantity\s*\n(.*?)LABEL TOTAL', text, re.DOTALL | re.IGNORECASE)
     if table_match:
         for line in table_match.group(1).strip().splitlines():
             line = line.strip()
@@ -292,21 +309,13 @@ def merge_sscc_groups(df):
         first = group.iloc[0].copy()
         if len(group) > 1:
             first["Size"]        = "/".join(group["Size"].tolist())
-            first["Size Detail"] = "/".join(
-                f'{r["Size"]}{r["Quantity"]}' for _, r in group.iterrows()
-            )
-            first["Quantity"]    = str(sum(
-                int(q) for q in group["Quantity"] if str(q).isdigit()
-            ))
+            first["Size Detail"] = "/".join(f'{r["Size"]}{r["Quantity"]}' for _, r in group.iterrows())
+            first["Quantity"]    = str(sum(int(q) for q in group["Quantity"] if str(q).isdigit()))
         else:
             first["Size Detail"] = ""
         return first
 
-    return (
-        df.groupby("SSCC (digits)", sort=False, group_keys=False)
-          .apply(_merge)
-          .reset_index(drop=True)
-    )
+    return df.groupby("SSCC (digits)", sort=False, group_keys=False).apply(_merge).reset_index(drop=True)
 
 
 CMUS_COLUMN_ORDER = [
@@ -358,7 +367,6 @@ def build_excel(df, col_widths, summary_df=None, highlight_mixed=True):
         worksheet.set_row(0, 20)
         worksheet.freeze_panes(1, 0)
 
-        # Optional summary sheet
         if summary_df is not None and not summary_df.empty:
             summary_df.to_excel(writer, index=False, sheet_name='Summary')
             ws2 = writer.sheets['Summary']
@@ -384,35 +392,41 @@ if uploaded_file is not None:
                 for i, page in enumerate(pdf.pages):
                     text = page.extract_text()
                     fmt  = detect_format(text)
+                    
                     if fmt == "carton":
                         carton_rows.append(parse_carton_label(text, i + 1))
+                    elif fmt == "unichela":
+                        carton_rows.extend(extract_unichela_labels(text, i + 1))
                     elif fmt == "cmus":
                         cmus_rows.extend(extract_label_data(text))
+                        
                     if total_pages:
                         progress.progress((i + 1) / total_pages)
                 progress.empty()
 
-        # ── New carton-label format ────────────────────────────────────────
+        # ── Carton & Unichela Formats ───────────────────────────────────────
         if carton_rows:
             df = pd.DataFrame(carton_rows)
             for col in CARTON_COLUMN_ORDER:
                 if col not in df.columns:
                     df[col] = ""
             df = df[CARTON_COLUMN_ORDER].astype(str).replace("nan", "")
+            
+            # Barcode duplicate වීම වැළැක්වීම
+            df = df.drop_duplicates(subset=['Carton Barcode'], keep='first')
 
             total_cartons = len(df)
             total_qty = sum(int(q) for q in df["Qty"] if str(q).isdigit())
 
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("මුළු Cartons", f"{total_cartons:,}")
+            c1.metric("මුළු Cartons (Unique)", f"{total_cartons:,}")
             c2.metric("මුළු Qty", f"{total_qty:,}")
             c3.metric("PO #", df["PO #"].iloc[0] if total_cartons else "-")
             c4.metric("Style", df["Style / Color"].iloc[0] if total_cartons else "-")
 
-            st.success(f"✅ Cartons {total_cartons:,} ක දත්ත සාර්ථකව හඳුනා ගන්නා ලදී!")
+            st.success(f"✅ Cartons {total_cartons:,} ක දත්ත සාර්ථකව හඳුනා ගන්නා ලදී! (Duplicates ඉවත් කරන ලදී)")
             st.dataframe(df, use_container_width=True, height=420)
 
-            # Summary by PO / Style / Color / Size / Ship To
             summary = (
                 df.assign(_q=pd.to_numeric(df["Qty"], errors="coerce").fillna(0).astype(int))
                   .groupby(["Ship To", "PO #", "Style / Color", "Color", "Size"], as_index=False)
@@ -424,9 +438,7 @@ if uploaded_file is not None:
             with st.expander("📋 සාරාංශය (Summary)"):
                 st.dataframe(summary, use_container_width=True)
 
-            excel_bytes = build_excel(
-                df, CARTON_COL_WIDTHS, summary_df=summary, highlight_mixed=False
-            )
+            excel_bytes = build_excel(df, CARTON_COL_WIDTHS, summary_df=summary, highlight_mixed=False)
             st.download_button(
                 label="📥 Download Master Excel File",
                 data=excel_bytes,
@@ -434,7 +446,7 @@ if uploaded_file is not None:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-        # ── Original CMUS format ───────────────────────────────────────────
+        # ── CMUS format ────────────────────────────────────────────────────
         elif cmus_rows:
             df = pd.DataFrame(cmus_rows)
             df = merge_sscc_groups(df)
@@ -442,11 +454,12 @@ if uploaded_file is not None:
                 if col not in df.columns:
                     df[col] = ""
             df = df[CMUS_COLUMN_ORDER].astype(str).replace("nan", "")
+            
+            # CMUS format එක සඳහා Barcode/SSCC duplicate වීම වැළැක්වීම
+            df = df.drop_duplicates(subset=['SSCC (digits)'], keep='first')
 
-            total_labels = df["Carton No."].nunique()
-            st.success(
-                f"✅ ලේබල් {total_labels} ක දත්ත (පේළි {len(df)}) සාර්ථකව හඳුනා ගන්නා ලදී!"
-            )
+            total_labels = len(df)
+            st.success(f"✅ ලේබල් {total_labels} ක දත්ත සාර්ථකව හඳුනා ගන්නා ලදී! (Duplicates ඉවත් කරන ලදී)")
             st.dataframe(df, use_container_width=True)
 
             excel_bytes = build_excel(df, CMUS_COL_WIDTHS, highlight_mixed=True)
@@ -465,4 +478,4 @@ if uploaded_file is not None:
         raise
 
 st.markdown("---")
-st.caption("© 2024 AI Shipping Tool | Developed by **Ishanka Madusanka**")
+st.caption("© 2024 AI Shipping Tool | Developed by **Lakshan**")
