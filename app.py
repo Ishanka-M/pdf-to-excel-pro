@@ -532,4 +532,4 @@ if uploaded_files:
         raise
 
 st.markdown("---")
-st.caption("© 2024 AI Shipping Tool | Developed by **Lakshan**")
+st.caption("© 2024 AI Shipping Tool | Developed by **Ishanka_M**")
