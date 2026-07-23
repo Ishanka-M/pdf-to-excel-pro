@@ -1,5 +1,8 @@
 streamlit
 pdfplumber
+pymupdf
 pandas
 xlsxwriter
-openpyxl
+pillow
+pytesseract
+pyzbar
