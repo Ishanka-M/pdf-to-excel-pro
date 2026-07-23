@@ -7,7 +7,7 @@ import re
 st.set_page_config(page_title="AI Shipping Label Extractor", layout="wide")
 
 st.title("📊 AI Multi-Label & EDI Shipping Converter")
-st.subheader("Developed by Lakshan")
+st.subheader("Developed by Ishanka_M")
 st.markdown("---")
 
 uploaded_files = st.file_uploader(
