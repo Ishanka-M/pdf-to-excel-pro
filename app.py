@@ -6,11 +6,15 @@ import re
 
 st.set_page_config(page_title="AI Shipping Label Extractor", layout="wide")
 
-st.title("📊 AI Shipping Label to Excel Converter")
-st.subheader("Developed by Ishanka_M")
+st.title("📊 AI Multi-Label & EDI Shipping Converter")
+st.subheader("Developed by Lakshan")
 st.markdown("---")
 
-uploaded_file = st.file_uploader("ඔබේ PDF ලේබල් ගොනුව මෙතැනට Upload කරන්න", type="pdf")
+uploaded_files = st.file_uploader(
+    "ඔබේ PDF ලේබල් ගොනු (එක් ගොනුවක් හෝ ගොනු කිහිපයක්) මෙතැනට Upload කරන්න", 
+    type="pdf", 
+    accept_multiple_files=True
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -38,11 +42,13 @@ def gtin_check_digit(d13):
 def detect_format(text):
     if not text:
         return None
-    # අලුත් format එක හඳුනාගැනීම (Unichela / McDonough ආදිය)
+    # 1. Unichela / Bulk Format
     if "UNICHELA" in text or "NON-CONFORMING" in text or "MCDONOUGH" in text:
         return "unichela"
+    # 2. CMUS Format
     if "Material #" in text or "Ship From:" in text:
         return "cmus"
+    # 3. Rotated GS1 Carton Format
     rev = " ".join(reverse_lines(text))
     if "CARTON" in rev and ("(01)" in rev or "STYLE/COLOR" in rev):
         return "carton"
@@ -52,9 +58,15 @@ def detect_format(text):
 # ─────────────────────────────────────────────────────────────────────────────
 # Parser 1 — Rotated GS1 carton label
 # ─────────────────────────────────────────────────────────────────────────────
-def parse_carton_label(text, page_no):
+def parse_carton_label(text, file_page_ref):
     lines = reverse_lines(text)
     joined = " ".join(lines)
+
+    # Box Number Extraction (Top Right Number)
+    box_m = re.search(r'\(Complete Grid\)\s*(\d+)', joined)
+    if not box_m:
+        box_m = re.search(r'\b(\d{2,4})\b\s*(?:QTY|\(Complete Grid\)|RFID)', joined)
+    box_no = box_m.group(1) if box_m else ""
 
     m = re.search(r'(\w+)\s+(\w+)\s+TO:', joined)
     ship_name = f"{m.group(2)} {m.group(1)}" if m else ""
@@ -114,10 +126,11 @@ def parse_carton_label(text, page_no):
             desc = " ".join(reversed(run)).strip()
 
     return {
-        "Label No."     : page_no,
+        "File/Page"     : file_page_ref,
         "Ship To"       : ship_to,
         "Date"          : date,
         "PO #"          : po,
+        "Box Number"    : box_no,
         "Style / Color" : style,
         "Description"   : desc,
         "Color"         : color,
@@ -133,10 +146,7 @@ def parse_carton_label(text, page_no):
 # ─────────────────────────────────────────────────────────────────────────────
 # Parser 2 — Bulk / Unichela label format
 # ─────────────────────────────────────────────────────────────────────────────
-def extract_unichela_labels(text, page_no):
-    """
-    BULK_1.pdf වැනි එකම පිටුවේ ලේබල් කිහිපයක් තිබිය හැකි format එක සඳහා
-    """
+def extract_unichela_labels(text, file_page_ref):
     rows = []
     parts = text.split("SHIP TO:")
     
@@ -154,15 +164,29 @@ def extract_unichela_labels(text, page_no):
         
         po_m = re.search(r'PO#\s*(\d+)', cleaned)
         po = po_m.group(1) if po_m else ""
+
+        # Box Number Extraction (Top Right Corner / Near Complete Grid)
+        box_no = ""
+        box_m = re.search(r'\(Complete Grid\)\s*(\d+)', cleaned)
+        if box_m:
+            box_no = box_m.group(1)
+        else:
+            box_m = re.search(r'\b(\d{2,4})\b\s*(?:QTY|\(Complete Grid\)|RFID)', cleaned)
+            if box_m:
+                box_no = box_m.group(1)
+            else:
+                top_nums = re.findall(r'\b\d{2,4}\b', cleaned[:120] + " " + cleaned[-120:])
+                for n in top_nums:
+                    if n != qty and n != po and (len(po) == 0 or n not in po):
+                        box_no = n
+                        break
         
-        # Style / Size හඳුනාගැනීම
         style, size = "", ""
         style_size_m = re.search(r'\b(XXS|XS|S|M|L|XL|XXL|\d+[SML]?)\s+([A-Z0-9]+(?:\s*-\s*[A-Z0-9]+)+)', cleaned)
         if style_size_m:
             size = style_size_m.group(1)
             style = style_size_m.group(2)
             
-        # Barcode අංකය හඳුනාගැනීම (දිගු ඉලක්කම් පෙළ)
         barcode = ""
         b_match = re.search(r'QTY\s+\d+\s+([\d\s]{15,})\s+CARTON', cleaned)
         if b_match:
@@ -173,10 +197,11 @@ def extract_unichela_labels(text, page_no):
                 barcode = max(numbers, key=len)
                 
         rows.append({
-            "Label No."     : page_no,
+            "File/Page"     : file_page_ref,
             "Ship To"       : ship_to,
             "Date"          : date,
             "PO #"          : po,
+            "Box Number"    : box_no,
             "Style / Color" : style,
             "Description"   : "UNICHELA / NON-CONFORMING",
             "Color"         : "",
@@ -191,24 +216,24 @@ def extract_unichela_labels(text, page_no):
 
 
 CARTON_COLUMN_ORDER = [
-    "Label No.", "Ship To", "Date", "PO #",
+    "File/Page", "Ship To", "Date", "PO #", "Box Number",
     "Style / Color", "Description", "Color", "Size",
     "Qty", "GTIN (01)", "Carton No.", "Carton Seq", "Carton Barcode",
 ]
 
 CARTON_COL_WIDTHS = {
-    "Label No."     : 9,  "Ship To"       : 28, "Date"          : 12,
-    "PO #"          : 14, "Style / Color" : 16, "Description"   : 32,
-    "Color"         : 10, "Size"          : 10, "Qty"           : 8,
-    "GTIN (01)"     : 18, "Carton No."    : 24, "Carton Seq"    : 13,
-    "Carton Barcode": 24,
+    "File/Page"     : 18, "Ship To"       : 28, "Date"          : 12,
+    "PO #"          : 14, "Box Number"    : 12, "Style / Color" : 16, 
+    "Description"   : 32, "Color"         : 10, "Size"          : 10, 
+    "Qty"           : 8,  "GTIN (01)"     : 18, "Carton No."    : 24, 
+    "Carton Seq"    : 13, "Carton Barcode": 24,
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Parser 3 — CMUS / Club Monaco label
 # ─────────────────────────────────────────────────────────────────────────────
-def extract_label_data(text):
+def extract_label_data(text, file_page_ref):
     rows = []
 
     order_match = re.search(r'Order No\.:(\S+)\s+(\d+)', text)
@@ -241,6 +266,9 @@ def extract_label_data(text):
     total_cartons = carton_match.group(2) if carton_match else ""
     carton_label  = f"{carton_no} of {total_cartons}" if carton_no else ""
 
+    # CMUS Format Box Number Mapping
+    box_no = carton_no
+
     carton_total_match = re.search(r'CARTON TOTAL\s+(\d+)', text, re.IGNORECASE)
     carton_total = carton_total_match.group(1) if carton_total_match else ""
 
@@ -269,11 +297,13 @@ def extract_label_data(text):
             else:
                 continue
             rows.append({
+                "File/Page"      : file_page_ref,
                 "Order No."      : order_no,
                 "Seq No."        : seq_no,
                 "Destination"    : destination,
                 "Ship From"      : ship_from,
                 "Ship To"        : ship_to,
+                "Box Number"     : box_no,
                 "Material #"     : material,
                 "Size"           : size,
                 "Quantity"       : qty,
@@ -286,11 +316,13 @@ def extract_label_data(text):
 
     if not rows:
         rows.append({
+            "File/Page"      : file_page_ref,
             "Order No."      : order_no,
             "Seq No."        : seq_no,
             "Destination"    : destination,
             "Ship From"      : ship_from,
             "Ship To"        : ship_to,
+            "Box Number"     : box_no,
             "Material #"     : "",
             "Size"           : "",
             "Quantity"       : "",
@@ -319,19 +351,20 @@ def merge_sscc_groups(df):
 
 
 CMUS_COLUMN_ORDER = [
-    "Order No.", "Seq No.", "Destination",
-    "Ship From", "Ship To",
+    "File/Page", "Order No.", "Seq No.", "Destination",
+    "Ship From", "Ship To", "Box Number",
     "Material #", "Size", "Size Detail", "Quantity",
     "Label Total", "Carton Total", "Carton No.",
     "SSCC (display)", "SSCC (digits)",
 ]
 
 CMUS_COL_WIDTHS = {
-    "Order No."      : 16, "Seq No."   : 8,  "Destination"  : 13,
-    "Ship From"      : 40, "Ship To"   : 35, "Material #"   : 18,
-    "Size"           : 10, "Size Detail": 22, "Quantity"    : 10,
-    "Label Total"    : 12, "Carton Total": 12, "Carton No." : 13,
-    "SSCC (display)" : 30, "SSCC (digits)": 25,
+    "File/Page"      : 18, "Order No."      : 16, "Seq No."   : 8,
+    "Destination"    : 13, "Ship From"      : 40, "Ship To"   : 35,
+    "Box Number"     : 12, "Material #"     : 18, "Size"      : 10, 
+    "Size Detail"    : 22, "Quantity"       : 10, "Label Total": 12, 
+    "Carton Total"   : 12, "Carton No."     : 13, "SSCC (display)" : 30, 
+    "SSCC (digits)"  : 25,
 }
 
 
@@ -379,99 +412,120 @@ def build_excel(df, col_widths, summary_df=None, highlight_mixed=True):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
+# Main Processing Loop
 # ─────────────────────────────────────────────────────────────────────────────
-if uploaded_file is not None:
+if uploaded_files:
     try:
-        with st.spinner("දත්ත කියවමින් පවතී..."):
-            carton_rows = []
-            cmus_rows   = []
-            with pdfplumber.open(uploaded_file) as pdf:
-                total_pages = len(pdf.pages)
-                progress = st.progress(0.0)
-                for i, page in enumerate(pdf.pages):
-                    text = page.extract_text()
-                    fmt  = detect_format(text)
-                    
-                    if fmt == "carton":
-                        carton_rows.append(parse_carton_label(text, i + 1))
-                    elif fmt == "unichela":
-                        carton_rows.extend(extract_unichela_labels(text, i + 1))
-                    elif fmt == "cmus":
-                        cmus_rows.extend(extract_label_data(text))
+        carton_rows = []
+        cmus_rows   = []
+        
+        with st.spinner("ගොනු ක්‍රියාත්මක වෙමින් පවතී..."):
+            total_files = len(uploaded_files)
+            progress = st.progress(0.0)
+
+            for file_idx, file in enumerate(uploaded_files):
+                with pdfplumber.open(file) as pdf:
+                    for page_idx, page in enumerate(pdf.pages):
+                        text = page.extract_text()
+                        fmt  = detect_format(text)
                         
-                    if total_pages:
-                        progress.progress((i + 1) / total_pages)
-                progress.empty()
+                        file_ref = f"{file.name[:12]}.. P.{page_idx+1}"
+                        
+                        if fmt == "carton":
+                            carton_rows.append(parse_carton_label(text, file_ref))
+                        elif fmt == "unichela":
+                            carton_rows.extend(extract_unichela_labels(text, file_ref))
+                        elif fmt == "cmus":
+                            cmus_rows.extend(extract_label_data(text, file_ref))
 
-        # ── Carton & Unichela Formats ───────────────────────────────────────
-        if carton_rows:
-            df = pd.DataFrame(carton_rows)
-            for col in CARTON_COLUMN_ORDER:
-                if col not in df.columns:
-                    df[col] = ""
-            df = df[CARTON_COLUMN_ORDER].astype(str).replace("nan", "")
-            
-            # Barcode duplicate වීම වැළැක්වීම
-            df = df.drop_duplicates(subset=['Carton Barcode'], keep='first')
+                progress.progress((file_idx + 1) / total_files)
+            progress.empty()
 
-            total_cartons = len(df)
-            total_qty = sum(int(q) for q in df["Qty"] if str(q).isdigit())
+        if carton_rows or cmus_rows:
+            tab_titles = []
+            if carton_rows:
+                tab_titles.append("📦 Carton / Bulk EDI Format")
+            if cmus_rows:
+                tab_titles.append("🏷️ CMUS EDI Format")
+                
+            tabs = st.tabs(tab_titles)
+            tab_idx = 0
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("මුළු Cartons (Unique)", f"{total_cartons:,}")
-            c2.metric("මුළු Qty", f"{total_qty:,}")
-            c3.metric("PO #", df["PO #"].iloc[0] if total_cartons else "-")
-            c4.metric("Style", df["Style / Color"].iloc[0] if total_cartons else "-")
+            # ── 1. Carton / Bulk EDI Format Tab ──────────────────────────────
+            if carton_rows:
+                with tabs[tab_idx]:
+                    df_carton = pd.DataFrame(carton_rows)
+                    for col in CARTON_COLUMN_ORDER:
+                        if col not in df_carton.columns:
+                            df_carton[col] = ""
+                    df_carton = df_carton[CARTON_COLUMN_ORDER].astype(str).replace("nan", "")
+                    
+                    # Barcode duplicate ඉවත් කිරීම
+                    df_carton = df_carton.drop_duplicates(subset=['Carton Barcode'], keep='first')
 
-            st.success(f"✅ Cartons {total_cartons:,} ක දත්ත සාර්ථකව හඳුනා ගන්නා ලදී! (Duplicates ඉවත් කරන ලදී)")
-            st.dataframe(df, use_container_width=True, height=420)
+                    total_cartons = len(df_carton)
+                    total_qty = sum(int(q) for q in df_carton["Qty"] if str(q).isdigit())
 
-            summary = (
-                df.assign(_q=pd.to_numeric(df["Qty"], errors="coerce").fillna(0).astype(int))
-                  .groupby(["Ship To", "PO #", "Style / Color", "Color", "Size"], as_index=False)
-                  .agg(**{"Cartons": ("_q", "size"), "Total Qty": ("_q", "sum")})
-            )
-            summary["Total Qty"] = summary["Total Qty"].astype(str)
-            summary["Cartons"]   = summary["Cartons"].astype(str)
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("මුළු Cartons (Unique)", f"{total_cartons:,}")
+                    c2.metric("මුළු Qty", f"{total_qty:,}")
+                    c3.metric("අඩංගු ගොනු ගණන", len(uploaded_files))
 
-            with st.expander("📋 සාරාංශය (Summary)"):
-                st.dataframe(summary, use_container_width=True)
+                    st.success(f"✅ Carton/Bulk EDI හි ලේබල් {total_cartons:,} ක් සාර්ථකව හඳුනා ගන්නා ලදී!")
+                    st.dataframe(df_carton, use_container_width=True, height=400)
 
-            excel_bytes = build_excel(df, CARTON_COL_WIDTHS, summary_df=summary, highlight_mixed=False)
-            st.download_button(
-                label="📥 Download Master Excel File",
-                data=excel_bytes,
-                file_name="Carton_Master_Report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+                    summary = (
+                        df_carton.assign(_q=pd.to_numeric(df_carton["Qty"], errors="coerce").fillna(0).astype(int))
+                          .groupby(["Ship To", "PO #", "Style / Color", "Color", "Size"], as_index=False)
+                          .agg(**{"Cartons": ("_q", "size"), "Total Qty": ("_q", "sum")})
+                    )
+                    summary["Total Qty"] = summary["Total Qty"].astype(str)
+                    summary["Cartons"]   = summary["Cartons"].astype(str)
 
-        # ── CMUS format ────────────────────────────────────────────────────
-        elif cmus_rows:
-            df = pd.DataFrame(cmus_rows)
-            df = merge_sscc_groups(df)
-            for col in CMUS_COLUMN_ORDER:
-                if col not in df.columns:
-                    df[col] = ""
-            df = df[CMUS_COLUMN_ORDER].astype(str).replace("nan", "")
-            
-            # CMUS format එක සඳහා Barcode/SSCC duplicate වීම වැළැක්වීම
-            df = df.drop_duplicates(subset=['SSCC (digits)'], keep='first')
+                    with st.expander("📋 Cartons සාරාංශය (Summary)"):
+                        st.dataframe(summary, use_container_width=True)
 
-            total_labels = len(df)
-            st.success(f"✅ ලේබල් {total_labels} ක දත්ත සාර්ථකව හඳුනා ගන්නා ලදී! (Duplicates ඉවත් කරන ලදී)")
-            st.dataframe(df, use_container_width=True)
+                    excel_carton = build_excel(df_carton, CARTON_COL_WIDTHS, summary_df=summary, highlight_mixed=False)
+                    st.download_button(
+                        label="📥 Download Carton Master Excel Report",
+                        data=excel_carton,
+                        file_name="Carton_Bulk_EDI_Report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                tab_idx += 1
 
-            excel_bytes = build_excel(df, CMUS_COL_WIDTHS, highlight_mixed=True)
-            st.download_button(
-                label="📥 Download Master Excel File",
-                data=excel_bytes,
-                file_name="Shipping_Master_Report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            # ── 2. CMUS EDI Format Tab ─────────────────────────────────────────
+            if cmus_rows:
+                with tabs[tab_idx]:
+                    df_cmus = pd.DataFrame(cmus_rows)
+                    df_cmus = merge_sscc_groups(df_cmus)
+                    for col in CMUS_COLUMN_ORDER:
+                        if col not in df_cmus.columns:
+                            df_cmus[col] = ""
+                    df_cmus = df_cmus[CMUS_COLUMN_ORDER].astype(str).replace("nan", "")
+                    
+                    # SSCC Duplicate ඉවත් කිරීම
+                    df_cmus = df_cmus.drop_duplicates(subset=['SSCC (digits)'], keep='first')
+
+                    total_labels = len(df_cmus)
+                    
+                    c1, c2 = st.columns(2)
+                    c1.metric("මුළු CMUS Labels (Unique)", f"{total_labels:,}")
+                    c2.metric("අඩංගු ගොනු ගණන", len(uploaded_files))
+
+                    st.success(f"✅ CMUS EDI හි ලේබල් {total_labels:,} ක් සාර්ථකව හඳුනා ගන්නා ලදී!")
+                    st.dataframe(df_cmus, use_container_width=True, height=400)
+
+                    excel_cmus = build_excel(df_cmus, CMUS_COL_WIDTHS, highlight_mixed=True)
+                    st.download_button(
+                        label="📥 Download CMUS Master Excel Report",
+                        data=excel_cmus,
+                        file_name="CMUS_EDI_Report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
 
         else:
-            st.warning("PDF එකෙන් දත්ත හඳුනා ගත නොහැකි විය. (Format එක support නොකරයි)")
+            st.warning("Upload කරන ලද PDF ගොනුවලින් දත්ත හඳුනා ගත නොහැකි විය.")
 
     except Exception as e:
         st.error(f"දෝෂයක් සිදුවිය: {e}")
