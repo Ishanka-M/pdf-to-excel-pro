@@ -1,24 +1,28 @@
 import streamlit as st
 import pdfplumber
+import fitz  # PyMuPDF
 import pandas as pd
 import io
 import re
+from collections import Counter
+from PIL import Image, ImageOps
+import pytesseract
+from pyzbar.pyzbar import decode as zbar_decode
 
 st.set_page_config(page_title="AI Shipping Label Extractor", layout="wide")
 
-st.title("📊 AI Multi-Label & EDI Shipping Converter")
-st.subheader("Developed by Lakshan")
+st.title("📊 AI Shipping Label to Excel Converter")
+st.subheader("Developed by Ishanka Madusanka")
 st.markdown("---")
 
 uploaded_files = st.file_uploader(
-    "ඔබේ PDF ලේබල් ගොනු (එක් ගොනුවක් හෝ ගොනු කිහිපයක්) මෙතැනට Upload කරන්න", 
-    type="pdf", 
-    accept_multiple_files=True
+    "ඔබේ PDF ලේබල් ගොනු මෙතැනට Upload කරන්න (එකකට වඩා upload කළ හැක)",
+    type="pdf",
+    accept_multiple_files=True,
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Generic helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def clean_text(text):
     if text:
@@ -27,218 +31,423 @@ def clean_text(text):
 
 
 def reverse_lines(text):
+    """Reverses each line of sideways / mirrored rotated carton labels."""
     if not text:
         return []
     return [line[::-1] for line in text.split('\n')]
 
 
 def gtin_check_digit(d13):
+    """Standard GS1 GTIN check digit (weights 3,1 from the right)."""
     total = 0
     for i, ch in enumerate(reversed(d13)):
         total += int(ch) * (3 if i % 2 == 0 else 1)
     return (10 - (total % 10)) % 10
 
 
-def detect_format(text):
+def detect_text_format(text):
+    """
+    Decide parser and orientation for pages with a text layer.
+    Returns tuple: (format_name, is_reversed)
+    """
     if not text:
-        return None
-    # 1. Unichela / Bulk Format
-    if "UNICHELA" in text or "NON-CONFORMING" in text or "MCDONOUGH" in text:
-        return "unichela"
-    # 2. CMUS Format
+        return None, False
     if "Material #" in text or "Ship From:" in text:
-        return "cmus"
-    # 3. Rotated GS1 Carton Format
+        return "cmus", False
+    
+    # Check upright text
+    if "CARTON" in text and ("(01)" in text or "STYLE/COLOR" in text or "SHIP TO" in text or "PO#" in text or "PO " in text):
+        return "carton_text", False
+
+    # Check reversed text
     rev = " ".join(reverse_lines(text))
-    if "CARTON" in rev and ("(01)" in rev or "STYLE/COLOR" in rev):
-        return "carton"
-    return None
+    if "CARTON" in rev and ("(01)" in rev or "STYLE/COLOR" in rev or "SHIP TO" in rev or "PO#" in rev or "PO " in rev):
+        return "carton_text", True
+
+    return None, False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Parser 1 — Rotated GS1 carton label
+# Barcode decoding
 # ─────────────────────────────────────────────────────────────────────────────
-def parse_carton_label(text, file_page_ref):
-    lines = reverse_lines(text)
+def decode_page_barcodes(fitz_page, zoom=6):
+    pix = fitz_page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    for angle in (-90, 90, 0, 180):
+        test_img = img.rotate(angle, expand=True) if angle else img
+        results = zbar_decode(test_img)
+        numeric = sorted(
+            {r.data.decode(errors="ignore") for r in results
+             if r.data.decode(errors="ignore").isdigit()},
+            key=len, reverse=True,
+        )
+        if numeric:
+            return numeric, test_img
+    return [], img.rotate(-90, expand=True)
+
+
+def pick_carton_and_gtin(values):
+    if not values:
+        return "", ""
+    carton = values[0]
+    gtin = ""
+    for v in values[1:]:
+        if v != carton and 13 <= len(v) <= 17:
+            gtin = v
+            break
+    return carton, gtin
+
+
+def split_carton_barcode(barcode):
+    if len(barcode) >= 20:
+        return barcode[10:16], barcode[16:20]
+    return "", barcode
+
+
+COLOR_PATTERN = re.compile(
+    r'\b(Dark|Light|Navy|Royal|Bright)?\s?(Blue|Black|Green|Red|Grey|Gray|White|Brown|Beige|Khaki)\b',
+    re.IGNORECASE,
+)
+
+DESC_EXCLUDE = (
+    "SHIP", "CARTON", "UNICHELA", "CASUALLINE", "LIMITED", "PRIVATE",
+    "STYLE", "COLOR", "SIZE", "PCS", "DIM", "GRID", "COMPLETE",
+    "CONFORMING", "RFID", "FROM", "QTY", "DATE", "TO", "MCDONOUGH",
+)
+
+
+def extract_color(text):
+    m = COLOR_PATTERN.search(text)
+    if not m:
+        return ""
+    parts = [p for p in (m.group(1), m.group(2)) if p]
+    return " ".join(p.title() for p in parts)
+
+
+def extract_description(text):
+    for line in text.split("\n"):
+        words = re.findall(r"[A-Za-z]{2,}", line)
+        if len(words) < 2 or re.search(r'\d', line):
+            continue
+        upper_words = [w.upper() for w in words]
+        if any(any(ex in w for ex in DESC_EXCLUDE) for w in upper_words):
+            continue
+        if len(upper_words) == 2 and len(upper_words[1]) <= 2:
+            continue
+        return " ".join(words).upper()
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parser 1 — GS1 carton label WITH text layer (Upright & Reversed)
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_carton_text(text, page_no, is_reversed=False):
+    lines = reverse_lines(text) if is_reversed else [l.strip() for l in text.split('\n') if l.strip()]
     joined = " ".join(lines)
 
-    # Box Number Extraction (Top Right Number)
-    box_m = re.search(r'\(Complete Grid\)\s*(\d+)', joined)
-    if not box_m:
-        box_m = re.search(r'\b(\d{2,4})\b\s*(?:QTY|\(Complete Grid\)|RFID)', joined)
-    box_no = box_m.group(1) if box_m else ""
+    # Ship To extraction
+    ship_to = ""
+    m_dc = re.search(r'SHIP\s*TO:\s*([A-Za-z0-9\s.]+?)(?=\s*Date:|\s*QTY|\s*MCDONOUGH|\s*CARTON|\n|$)', joined, re.IGNORECASE)
+    ship_dc = clean_text(m_dc.group(1)) if m_dc else ""
+    m_city = re.search(r'\b([A-Z]{3,}(?:\s+[A-Z]{2,})?)\s+([A-Z]{2})\b', joined)
+    ship_city = f"{m_city.group(1)} {m_city.group(2)}" if m_city else ""
+    
+    if ship_dc and ship_city:
+        ship_to = ship_dc if ship_city in ship_dc else f"{ship_dc}, {ship_city}"
+    else:
+        ship_to = ship_dc or ship_city
 
-    m = re.search(r'(\w+)\s+(\w+)\s+TO:', joined)
-    ship_name = f"{m.group(2)} {m.group(1)}" if m else ""
-    m = re.search(r'Date:\s+(\w+)\s+(\w+)', joined)
-    ship_loc = f"{m.group(2)} {m.group(1)}" if m else ""
-    ship_to = ", ".join(filter(None, [ship_name, ship_loc]))
+    # Date
+    m_date = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', joined)
+    date = m_date.group(1) if m_date else ""
 
-    m = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', joined)
-    date = m.group(1) if m else ""
+    # Qty
+    m_qty = re.search(r'\bQTY\s*(\d{1,3})\b', joined, re.IGNORECASE)
+    if not m_qty:
+        m_qty = re.search(r'\b(\d{1,3})\s*QTY\b', joined, re.IGNORECASE)
+    qty = m_qty.group(1) if m_qty else ""
 
-    qty = ""
+    # PO #
+    m_po = re.search(r'\b(4\d{9})\b', joined)
+    if not m_po:
+        m_po = re.search(r'PO#?\s*(4?\d{6,10})', joined, re.IGNORECASE)
+    po = m_po.group(1) if m_po else ""
+
+    # Style / Color
+    style = ""
     for i, l in enumerate(lines):
-        if re.fullmatch(r'\d{1,2}/\d{1,2}/\d{4}', l):
-            if i >= 1 and lines[i - 1].isdigit():
-                qty = lines[i - 1]
-            break
+        if l == "-":
+            left = lines[i - 1] if i >= 1 else ""
+            right = lines[i + 1] if i + 1 < len(lines) else ""
+            cands = [t for t in (left, right) if re.fullmatch(r'[A-Z0-9]{2,10}', t)]
+            if len(cands) == 2:
+                a, b = sorted(cands, key=len, reverse=True)
+                style = f"{a}-{b}"
+                break
+    if not style:
+        m_style = re.search(r'([A-Z]{2,6}\d{3,6}\s*-\s*[A-Z0-9]{1,4})', joined)
+        style = re.sub(r'\s*-\s*', '-', m_style.group(1)) if m_style else ""
 
-    m = re.search(r'PO#?\s*(\d{6,})', joined)
-    po = m.group(1) if m else ""
-
-    m = re.search(r'([A-Z]{2,5}\d{3,}-\d+)', joined)
-    style = m.group(1) if m else ""
-
+    # GTIN (01)
     gtin = ""
-    m = re.search(r'\(01\)(\d+)', joined)
-    if m:
-        head = m.group(1)
-        b = re.search(r'\b(\d{11})\b', joined)
-        if b:
-            d13 = head + b.group(1)
-            gtin = d13 + str(gtin_check_digit(d13))
+    m_gtin = re.search(r'\(01\)\s*([\d\s]{12,18})', joined)
+    if m_gtin:
+        gtin_digits = re.sub(r'\D', '', m_gtin.group(1))
+        if len(gtin_digits) >= 13:
+            gtin = gtin_digits[:14]
+    if not gtin:
+        m_g_head = re.search(r'\(01\)(\d+)', joined)
+        if m_g_head:
+            head = m_g_head.group(1)
+            b = re.search(r'\b(\d{11})\b', joined)
+            if b:
+                d13 = head + b.group(1)
+                gtin = d13 + str(gtin_check_digit(d13))
 
-    color = "Black" if "Black" in joined else ""
-    size  = "Prepack" if "Prepack" in joined else ""
+    color = extract_color(joined)
 
-    prefix = mid = seq = chk = ""
-    for i, l in enumerate(lines):
-        if l == "CARTON":
-            mid    = lines[i + 1] if i + 1 < len(lines) else ""
-            prefix = lines[i + 2] if i + 2 < len(lines) else ""
-            seq    = lines[i - 2] if i - 2 >= 0 else ""
-            chk    = lines[i - 3] if i - 3 >= 0 else ""
-            break
-    carton_full = " ".join(filter(None, [prefix, mid, seq, chk]))
-    carton_seq  = (mid + seq) if (mid and seq) else seq 
-    carton_code = re.sub(r'\D', '', carton_full) 
-
-    desc = ""
-    if prefix:
-        idxs = [i for i, l in enumerate(lines) if l == prefix]
-        if idxs:
-            run = []
-            for l in lines[idxs[-1] + 1:]:
-                if l.startswith("PO#") or (po and l == po):
+    # Size
+    size = ""
+    m_size = re.search(r'\bSIZE\b\s*([A-Z]{1,4}\s*\d{0,2})', joined, re.IGNORECASE)
+    if m_size:
+        size = clean_text(m_size.group(1))
+    else:
+        size_tokens = {"XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL"}
+        for i, l in enumerate(lines):
+            if re.fullmatch(r'\d{2}', l):
+                for j in (i - 1, i + 1):
+                    if 0 <= j < len(lines) and lines[j] in size_tokens:
+                        size = f"{lines[j]} {l}"
+                        break
+                if size:
                     break
-                run.append(l)
-            desc = " ".join(reversed(run)).strip()
+    if not size and "Prepack" in joined:
+        size = "Prepack"
+
+    # Grid / Ref No.
+    grid_pcs = ""
+    m_grid = re.search(r'\(Complete Grid\)\s*(\d{1,4})', joined, re.IGNORECASE)
+    if m_grid:
+        grid_pcs = m_grid.group(1)
+    else:
+        for i, l in enumerate(lines):
+            if "grid" in l.lower():
+                for j in range(max(0, i - 3), min(len(lines), i + 4)):
+                    if re.fullmatch(r'\d{2,4}', lines[j]):
+                        grid_pcs = lines[j]
+                        break
+                if grid_pcs:
+                    break
+
+    status = "NON-CONFORMING" if re.search(r'NON-CONFORMING', joined, re.IGNORECASE) else ""
+    desc = extract_description("\n".join(lines))
 
     return {
-        "File/Page"     : file_page_ref,
-        "Ship To"       : ship_to,
-        "Date"          : date,
-        "PO #"          : po,
-        "Box Number"    : box_no,
-        "Style / Color" : style,
-        "Description"   : desc,
-        "Color"         : color,
-        "Size"          : size,
-        "Qty"           : qty,
-        "GTIN (01)"     : gtin,
-        "Carton No."    : carton_full,
-        "Carton Seq"    : carton_seq,
-        "Carton Barcode": carton_code,
+        "Label No.": page_no,
+        "Ship To": ship_to,
+        "Date": date,
+        "PO #": po,
+        "Style / Color": style,
+        "Description": desc,
+        "Color": color,
+        "Size": size,
+        "Qty": qty,
+        "GTIN (01)": gtin,
+        "Grid / Ref No.": grid_pcs,
+        "Status": status,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Parser 2 — Bulk / Unichela label format
+# Parser 2 — Rotated GS1 carton label WITHOUT text layer (OCR Fallback)
 # ─────────────────────────────────────────────────────────────────────────────
-def extract_unichela_labels(text, file_page_ref):
-    rows = []
-    parts = text.split("SHIP TO:")
-    
-    for part in parts[1:]:
-        cleaned = clean_text("SHIP TO: " + part)
-        
-        date_m = re.search(r'Date:\s*(\d{1,2}/\d{1,2}/\d{4})', cleaned)
-        date = date_m.group(1) if date_m else ""
-        
-        ship_m = re.search(r'Date:.*?\d{4}\s+(.*?)\s+QTY', cleaned)
-        ship_to = ship_m.group(1).strip() if ship_m else "MCDONOUGH GA MCDONOUGH DC"
-        
-        qty_m = re.search(r'QTY\s+(\d+)', cleaned)
-        qty = qty_m.group(1) if qty_m else ""
-        
-        po_m = re.search(r'PO#\s*(\d+)', cleaned)
-        po = po_m.group(1) if po_m else ""
+FIELD_BOXES = {
+    "ship_dc": (500, 30, 1650, 160),
+    "ship_city": (480, 180, 1650, 360),
+    "date": (1630, 255, 1970, 350),
+    "qty": (2020, 210, 2180, 350),
+    "po": (630, 1360, 1650, 1550),
+    "desc": (480, 1240, 1350, 1340),
+    "style": (480, 1550, 1500, 1710),
+    "color": (1850, 1490, 2220, 1580),
+    "size": (1870, 1565, 2200, 1690),
+}
+EXPECTED_CANVAS = (4752, 3672)
 
-        # Box Number Extraction (Top Right Corner / Near Complete Grid)
-        box_no = ""
-        box_m = re.search(r'\(Complete Grid\)\s*(\d+)', cleaned)
-        if box_m:
-            box_no = box_m.group(1)
-        else:
-            box_m = re.search(r'\b(\d{2,4})\b\s*(?:QTY|\(Complete Grid\)|RFID)', cleaned)
-            if box_m:
-                box_no = box_m.group(1)
-            else:
-                top_nums = re.findall(r'\b\d{2,4}\b', cleaned[:120] + " " + cleaned[-120:])
-                for n in top_nums:
-                    if n != qty and n != po and (len(po) == 0 or n not in po):
-                        box_no = n
-                        break
-        
-        style, size = "", ""
-        style_size_m = re.search(r'\b(XXS|XS|S|M|L|XL|XXL|\d+[SML]?)\s+([A-Z0-9]+(?:\s*-\s*[A-Z0-9]+)+)', cleaned)
-        if style_size_m:
-            size = style_size_m.group(1)
-            style = style_size_m.group(2)
-            
-        barcode = ""
-        b_match = re.search(r'QTY\s+\d+\s+([\d\s]{15,})\s+CARTON', cleaned)
-        if b_match:
-            barcode = b_match.group(1).replace(" ", "")
-        else:
-            numbers = re.findall(r'\d{12,}', cleaned.replace(" ", ""))
-            if numbers:
-                barcode = max(numbers, key=len)
-                
-        rows.append({
-            "File/Page"     : file_page_ref,
-            "Ship To"       : ship_to,
-            "Date"          : date,
-            "PO #"          : po,
-            "Box Number"    : box_no,
-            "Style / Color" : style,
-            "Description"   : "UNICHELA / NON-CONFORMING",
-            "Color"         : "",
-            "Size"          : size,
-            "Qty"           : qty,
-            "GTIN (01)"     : "",
-            "Carton No."    : barcode,
-            "Carton Seq"    : "",
-            "Carton Barcode": barcode,
-        })
+
+def ocr_field(rotated_img, box, whitelist="", psm=7, scale=2, retry_psms=(8, 13, 6)):
+    w, h = rotated_img.size
+    x0, y0, x1, y1 = box
+    crop = rotated_img.crop((max(0, x0), max(0, y0), min(w, x1), min(h, y1)))
+    crop = crop.resize((crop.width * scale, crop.height * scale))
+    gray = ImageOps.autocontrast(crop.convert("L"))
+    wl = f"-c tessedit_char_whitelist={whitelist}" if whitelist else ""
+    txt = pytesseract.image_to_string(gray, config=f"--psm {psm} {wl}").strip()
+    if txt:
+        return txt
+    if whitelist:
+        for alt_psm in retry_psms:
+            txt = pytesseract.image_to_string(gray, config=f"--psm {alt_psm} {wl}").strip()
+            if txt:
+                return txt
+    return ""
+
+
+def ocr_label_text(rotated_img):
+    gray = ImageOps.autocontrast(rotated_img.convert("L"))
+    return pytesseract.image_to_string(gray, config="--psm 6")
+
+
+def ocr_corner_number(rotated_img):
+    w, h = rotated_img.size
+    box = (w - 194, 46, w - 59, 110)
+    return ocr_field(rotated_img, box, whitelist="0123456789", psm=7, scale=4)
+
+
+def parse_carton_ocr_precise(rotated_img, page_no):
+    ship_dc_raw = ocr_field(rotated_img, FIELD_BOXES["ship_dc"])
+    ship_city_raw = ocr_field(rotated_img, FIELD_BOXES["ship_city"])
+    m = re.search(r'([A-Z]{2,}(?:\s[A-Z]{2,})?)\s+([A-Z]{2})\b', ship_city_raw)
+    ship_city = f"{m.group(1)} {m.group(2)}" if m else clean_text(ship_city_raw)
+    city_word = ship_city.split()[0] if ship_city else ""
+    ship_dc = f"{city_word} DC" if city_word and re.search(r'\bDC\b', ship_dc_raw, re.IGNORECASE) else clean_text(re.sub(r'(?i)ship\s*to:?\s*', '', ship_dc_raw))
+    ship_to = ", ".join(filter(None, [ship_dc, ship_city]))
+
+    date = ocr_field(rotated_img, FIELD_BOXES["date"], whitelist="0123456789/")
+    if not re.fullmatch(r'\d{1,2}/\d{1,2}/20\d{2}', date):
+        date = ""
+
+    qty_raw = ocr_field(rotated_img, FIELD_BOXES["qty"], whitelist="0123456789")
+    qty = qty_raw if re.fullmatch(r'\d{1,3}', qty_raw) else ""
+
+    po_raw = ocr_field(rotated_img, FIELD_BOXES["po"])
+    m = re.search(r'(\d{6,})', po_raw)
+    po = m.group(1) if m else ""
+
+    style_raw = ocr_field(rotated_img, FIELD_BOXES["style"])
+    style = re.sub(r'\s*-\s*', '-', clean_text(style_raw))
+
+    desc = clean_text(ocr_field(rotated_img, FIELD_BOXES["desc"])).upper()
+    color = clean_text(ocr_field(rotated_img, FIELD_BOXES["color"]))
+
+    size_raw = ocr_field(rotated_img, FIELD_BOXES["size"])
+    m = re.search(r'([A-Z]{1,4})\D{0,3}(\d{2})', size_raw)
+    size = f"{m.group(1)} {m.group(2)}" if m else clean_text(size_raw)
+
+    return {
+        "Label No.": page_no,
+        "Ship To": ship_to,
+        "Date": date,
+        "PO #": po,
+        "Style / Color": style,
+        "Description": desc,
+        "Color": color,
+        "Size": size,
+        "Qty": qty,
+        "GTIN (01)": "",
+        "Status": "",
+    }
+
+
+def parse_carton_ocr_fallback(text, page_no):
+    m = re.search(r'SHIP\s*TO:?\s*([A-Za-z][A-Za-z .]{2,40})', text, re.IGNORECASE)
+    ship_dc = clean_text(m.group(1).split("\n")[0]) if m else ""
+    m = re.search(r'\n\s*([A-Z]{3,}(?:\s[A-Z]{2,})?)\s+([A-Z]{2})\b', text)
+    ship_city = f"{m.group(1)} {m.group(2)}" if m else ""
+    ship_to = ", ".join(filter(None, [ship_dc, ship_city]))
+
+    m = re.search(r'(\d{1,2}/\d{1,2}/20\d{2})', text)
+    date = m.group(1) if m else ""
+
+    m = re.search(r'\b(4\d{9})\b', text)
+    po = m.group(1) if m else ""
+
+    m = re.search(r'([A-Z]{2,6}\d{3,6}\s?-\s?[A-Z0-9]{2,4})', text)
+    style = re.sub(r'\s*-\s*', '-', clean_text(m.group(1))) if m else ""
+
+    desc = extract_description(text[m.end():] if m else text)
+    color = extract_color(text)
+
+    m = re.search(r'\bSIZE\b\D{0,10}([A-Z0-9]{1,4})\s+(\d{2})\b', text, re.IGNORECASE)
+    size = f"{m.group(1)} {m.group(2)}" if m else ""
+
+    m = re.search(r'QTY\D{0,6}(\d{1,3})\b', text, re.IGNORECASE)
+    qty = m.group(1) if m else ""
+
+    status = "NON-CONFORMING" if re.search(r'NON-CONFORMING', text, re.IGNORECASE) else ""
+
+    return {
+        "Label No.": page_no,
+        "Ship To": ship_to,
+        "Date": date,
+        "PO #": po,
+        "Style / Color": style,
+        "Description": desc,
+        "Color": color,
+        "Size": size,
+        "Qty": qty,
+        "GTIN (01)": "",
+        "Status": status,
+    }
+
+
+def parse_carton_ocr(rotated_img, page_no):
+    w, h = rotated_img.size
+    ew, eh = EXPECTED_CANVAS
+    close_enough = abs(w - ew) / ew < 0.03 and abs(h - eh) / eh < 0.03
+    if close_enough:
+        return parse_carton_ocr_precise(rotated_img, page_no)
+    return parse_carton_ocr_fallback(ocr_label_text(rotated_img), page_no)
+
+
+def apply_batch_mode_correction(rows):
+    if not rows:
+        return rows
+    fields = ["Ship To", "PO #", "Style / Color", "Description", "Color"]
+    modes = {}
+    for f in fields:
+        vals = [r[f] for r in rows if r.get(f)]
+        if vals:
+            modes[f] = Counter(vals).most_common(1)[0][0]
+    for r in rows:
+        flagged = False
+        for f in fields:
+            mode_val = modes.get(f, "")
+            if not r.get(f):
+                if mode_val:
+                    r[f] = mode_val
+                    flagged = True
+            elif mode_val and r[f] != mode_val:
+                flagged = True
+        r["Needs Review"] = "Yes" if flagged else ""
     return rows
 
 
 CARTON_COLUMN_ORDER = [
-    "File/Page", "Ship To", "Date", "PO #", "Box Number",
+    "File", "Label No.", "Format", "Ship To", "Date", "PO #",
     "Style / Color", "Description", "Color", "Size",
-    "Qty", "GTIN (01)", "Carton No.", "Carton Seq", "Carton Barcode",
+    "Qty", "GTIN (01)", "Grid / Ref No.", "Status",
+    "Carton No.", "Carton Seq", "Carton Barcode", "Needs Review",
 ]
 
 CARTON_COL_WIDTHS = {
-    "File/Page"     : 18, "Ship To"       : 28, "Date"          : 12,
-    "PO #"          : 14, "Box Number"    : 12, "Style / Color" : 16, 
-    "Description"   : 32, "Color"         : 10, "Size"          : 10, 
-    "Qty"           : 8,  "GTIN (01)"     : 18, "Carton No."    : 24, 
-    "Carton Seq"    : 13, "Carton Barcode": 24,
+    "File": 22, "Label No.": 9, "Format": 12,
+    "Ship To": 28, "Date": 12, "PO #": 14,
+    "Style / Color": 16, "Description": 32, "Color": 10, "Size": 10,
+    "Qty": 8, "GTIN (01)": 18, "Grid / Ref No.": 14, "Status": 16,
+    "Carton No.": 12, "Carton Seq": 12,
+    "Carton Barcode": 24, "Needs Review": 12,
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Parser 3 — CMUS / Club Monaco label
 # ─────────────────────────────────────────────────────────────────────────────
-def extract_label_data(text, file_page_ref):
+def extract_label_data(text):
     rows = []
-
     order_match = re.search(r'Order No\.:(\S+)\s+(\d+)', text)
     order_no = order_match.group(1) if order_match else ""
-    seq_no   = order_match.group(2) if order_match else ""
+    seq_no = order_match.group(2) if order_match else ""
 
     dest_match = re.search(r'Factory I/O:\s*\n(\S+)', text)
     destination = dest_match.group(1) if dest_match else ""
@@ -262,12 +471,9 @@ def extract_label_data(text, file_page_ref):
     ship_to = ", ".join(filter(None, [to_name, to_street, to_city]))
 
     carton_match = re.search(r'CARTON NUMBER\s+(\d+)\s+of\s+(\d+)', text, re.IGNORECASE)
-    carton_no     = carton_match.group(1) if carton_match else ""
+    carton_no = carton_match.group(1) if carton_match else ""
     total_cartons = carton_match.group(2) if carton_match else ""
-    carton_label  = f"{carton_no} of {total_cartons}" if carton_no else ""
-
-    # CMUS Format Box Number Mapping
-    box_no = carton_no
+    carton_label = f"{carton_no} of {total_cartons}" if carton_no else ""
 
     carton_total_match = re.search(r'CARTON TOTAL\s+(\d+)', text, re.IGNORECASE)
     carton_total = carton_total_match.group(1) if carton_total_match else ""
@@ -277,13 +483,16 @@ def extract_label_data(text, file_page_ref):
 
     sscc_raw_match = re.search(r'\(00\)([\d\s]+)', text)
     if sscc_raw_match:
-        raw          = sscc_raw_match.group(0).split('\n')[0].strip()
+        raw = sscc_raw_match.group(0).split('\n')[0].strip()
         sscc_display = raw
-        sscc_digits  = re.sub(r'[^\d]', '', raw)[:20]
+        sscc_digits = re.sub(r'[^\d]', '', raw)[:20]
     else:
         sscc_display = sscc_digits = ""
 
-    table_match = re.search(r'Material\s*#\s+Size\s+Quantity\s*\n(.*?)LABEL TOTAL', text, re.DOTALL | re.IGNORECASE)
+    table_match = re.search(
+        r'Material\s*#\s+Size\s+Quantity\s*\n(.*?)LABEL TOTAL',
+        text, re.DOTALL | re.IGNORECASE
+    )
     if table_match:
         for line in table_match.group(1).strip().splitlines():
             line = line.strip()
@@ -297,40 +506,22 @@ def extract_label_data(text, file_page_ref):
             else:
                 continue
             rows.append({
-                "File/Page"      : file_page_ref,
-                "Order No."      : order_no,
-                "Seq No."        : seq_no,
-                "Destination"    : destination,
-                "Ship From"      : ship_from,
-                "Ship To"        : ship_to,
-                "Box Number"     : box_no,
-                "Material #"     : material,
-                "Size"           : size,
-                "Quantity"       : qty,
-                "Label Total"    : label_total,
-                "Carton Total"   : carton_total,
-                "Carton No."     : carton_label,
-                "SSCC (display)" : sscc_display,
-                "SSCC (digits)"  : sscc_digits,
+                "Order No.": order_no, "Seq No.": seq_no, "Destination": destination,
+                "Ship From": ship_from, "Ship To": ship_to,
+                "Material #": material, "Size": size, "Quantity": qty,
+                "Label Total": label_total, "Carton Total": carton_total,
+                "Carton No.": carton_label,
+                "SSCC (display)": sscc_display, "SSCC (digits)": sscc_digits,
             })
 
     if not rows:
         rows.append({
-            "File/Page"      : file_page_ref,
-            "Order No."      : order_no,
-            "Seq No."        : seq_no,
-            "Destination"    : destination,
-            "Ship From"      : ship_from,
-            "Ship To"        : ship_to,
-            "Box Number"     : box_no,
-            "Material #"     : "",
-            "Size"           : "",
-            "Quantity"       : "",
-            "Label Total"    : label_total,
-            "Carton Total"   : carton_total,
-            "Carton No."     : carton_label,
-            "SSCC (display)" : sscc_display,
-            "SSCC (digits)"  : sscc_digits,
+            "Order No.": order_no, "Seq No.": seq_no, "Destination": destination,
+            "Ship From": ship_from, "Ship To": ship_to,
+            "Material #": "", "Size": "", "Quantity": "",
+            "Label Total": label_total, "Carton Total": carton_total,
+            "Carton No.": carton_label,
+            "SSCC (display)": sscc_display, "SSCC (digits)": sscc_digits,
         })
 
     return rows
@@ -340,51 +531,61 @@ def merge_sscc_groups(df):
     def _merge(group):
         first = group.iloc[0].copy()
         if len(group) > 1:
-            first["Size"]        = "/".join(group["Size"].tolist())
-            first["Size Detail"] = "/".join(f'{r["Size"]}{r["Quantity"]}' for _, r in group.iterrows())
-            first["Quantity"]    = str(sum(int(q) for q in group["Quantity"] if str(q).isdigit()))
+            first["Size"] = "/".join(group["Size"].tolist())
+            first["Size Detail"] = "/".join(
+                f'{r["Size"]}{r["Quantity"]}' for _, r in group.iterrows()
+            )
+            first["Quantity"] = str(sum(
+                int(q) for q in group["Quantity"] if str(q).isdigit()
+            ))
         else:
             first["Size Detail"] = ""
         return first
 
-    return df.groupby("SSCC (digits)", sort=False, group_keys=False).apply(_merge).reset_index(drop=True)
+    return (
+        df.groupby("SSCC (digits)", sort=False, group_keys=False)
+          .apply(_merge)
+          .reset_index(drop=True)
+    )
 
 
 CMUS_COLUMN_ORDER = [
-    "File/Page", "Order No.", "Seq No.", "Destination",
-    "Ship From", "Ship To", "Box Number",
+    "Order No.", "Seq No.", "Destination",
+    "Ship From", "Ship To",
     "Material #", "Size", "Size Detail", "Quantity",
     "Label Total", "Carton Total", "Carton No.",
     "SSCC (display)", "SSCC (digits)",
 ]
 
 CMUS_COL_WIDTHS = {
-    "File/Page"      : 18, "Order No."      : 16, "Seq No."   : 8,
-    "Destination"    : 13, "Ship From"      : 40, "Ship To"   : 35,
-    "Box Number"     : 12, "Material #"     : 18, "Size"      : 10, 
-    "Size Detail"    : 22, "Quantity"       : 10, "Label Total": 12, 
-    "Carton Total"   : 12, "Carton No."     : 13, "SSCC (display)" : 30, 
-    "SSCC (digits)"  : 25,
+    "Order No.": 16, "Seq No.": 8, "Destination": 13,
+    "Ship From": 40, "Ship To": 35, "Material #": 18,
+    "Size": 10, "Size Detail": 22, "Quantity": 10,
+    "Label Total": 12, "Carton Total": 12, "Carton No.": 13,
+    "SSCC (display)": 30, "SSCC (digits)": 25,
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Excel builder (shared)
+# Excel builder
 # ─────────────────────────────────────────────────────────────────────────────
-def build_excel(df, col_widths, summary_df=None, highlight_mixed=True):
+def build_excel(df, col_widths, summary_df=None, highlight_mixed=True, dup_df=None):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Shipping_Data')
-        workbook  = writer.book
+        workbook = writer.book
         worksheet = writer.sheets['Shipping_Data']
 
         header_fmt = workbook.add_format({
             'bold': True, 'bg_color': '#1E1E1E', 'font_color': 'white',
             'border': 1, 'align': 'center', 'valign': 'vcenter',
         })
-        data_fmt  = workbook.add_format({'border': 1, 'valign': 'vcenter'})
+        data_fmt = workbook.add_format({'border': 1, 'valign': 'vcenter'})
         mixed_fmt = workbook.add_format({
             'border': 1, 'valign': 'vcenter', 'bg_color': '#FFF9C4',
+        })
+        review_fmt = workbook.add_format({
+            'border': 1, 'valign': 'vcenter', 'bg_color': '#FFCDD2',
         })
 
         for col_num, col_name in enumerate(df.columns):
@@ -392,8 +593,9 @@ def build_excel(df, col_widths, summary_df=None, highlight_mixed=True):
             worksheet.set_column(col_num, col_num, col_widths.get(col_name, 18))
 
         for row_idx, row in df.iterrows():
+            needs_review = highlight_mixed and str(row.get("Needs Review", "")).lower() == "yes"
             is_mixed = highlight_mixed and "/" in str(row.get("Size", ""))
-            fmt = mixed_fmt if is_mixed else data_fmt
+            fmt = review_fmt if needs_review else (mixed_fmt if is_mixed else data_fmt)
             for col_idx, col_name in enumerate(df.columns):
                 worksheet.write(row_idx + 1, col_idx, row[col_name], fmt)
 
@@ -408,128 +610,191 @@ def build_excel(df, col_widths, summary_df=None, highlight_mixed=True):
                 ws2.set_column(col_num, col_num, max(14, len(str(col_name)) + 4))
             ws2.set_row(0, 20)
 
+        if dup_df is not None and not dup_df.empty:
+            dup_df.to_excel(writer, index=False, sheet_name='Duplicates_Removed')
+            ws3 = writer.sheets['Duplicates_Removed']
+            for col_num, col_name in enumerate(dup_df.columns):
+                ws3.write(0, col_num, col_name, header_fmt)
+                ws3.set_column(col_num, col_num, col_widths.get(col_name, 18))
+            ws3.set_row(0, 20)
+
     return output.getvalue()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main Processing Loop
+# Main
 # ─────────────────────────────────────────────────────────────────────────────
 if uploaded_files:
     try:
         carton_rows = []
-        cmus_rows   = []
-        
-        with st.spinner("ගොනු ක්‍රියාත්මක වෙමින් පවතී..."):
-            total_files = len(uploaded_files)
-            progress = st.progress(0.0)
+        cmus_rows = []
+        ocr_pages_processed = 0
 
-            for file_idx, file in enumerate(uploaded_files):
-                with pdfplumber.open(file) as pdf:
-                    for page_idx, page in enumerate(pdf.pages):
+        with st.spinner("දත්ත කියවමින් පවතී... (OCR අවශ්‍ය pages සඳහා තත්පර කිහිපයක් ගත විය හැක)"):
+            for uf in uploaded_files:
+                file_bytes = uf.read()
+
+                with pdfplumber.open(io.BytesIO(file_bytes)) as pdf, \
+                     fitz.open(stream=file_bytes, filetype="pdf") as fdoc:
+
+                    total_pages = len(pdf.pages)
+                    progress = st.progress(0.0, text=f"{uf.name} — processing…")
+                    file_ocr_rows = []
+
+                    for i, page in enumerate(pdf.pages):
                         text = page.extract_text()
-                        fmt  = detect_format(text)
-                        
-                        file_ref = f"{file.name[:12]}.. P.{page_idx+1}"
-                        
-                        if fmt == "carton":
-                            carton_rows.append(parse_carton_label(text, file_ref))
-                        elif fmt == "unichela":
-                            carton_rows.extend(extract_unichela_labels(text, file_ref))
-                        elif fmt == "cmus":
-                            cmus_rows.extend(extract_label_data(text, file_ref))
+                        fmt, is_reversed = detect_text_format(text)
 
-                progress.progress((file_idx + 1) / total_files)
-            progress.empty()
+                        if fmt == "cmus":
+                            cmus_rows.extend(extract_label_data(text))
 
-        if carton_rows or cmus_rows:
-            tab_titles = []
-            if carton_rows:
-                tab_titles.append("📦 Carton / Bulk EDI Format")
-            if cmus_rows:
-                tab_titles.append("🏷️ CMUS EDI Format")
-                
-            tabs = st.tabs(tab_titles)
-            tab_idx = 0
+                        elif fmt == "carton_text":
+                            row = parse_carton_text(text, i + 1, is_reversed=is_reversed)
+                            values, _ = decode_page_barcodes(fdoc[i])
+                            barcode, gtin = pick_carton_and_gtin(values)
+                            carton_no, carton_seq = split_carton_barcode(barcode)
+                            row["Carton Barcode"] = barcode
+                            row["Carton No."] = carton_no
+                            row["Carton Seq"] = carton_seq
+                            if gtin and not row.get("GTIN (01)"):
+                                row["GTIN (01)"] = gtin
+                            row["File"] = uf.name
+                            row["Format"] = "Text"
+                            row["Needs Review"] = ""
+                            carton_rows.append(row)
 
-            # ── 1. Carton / Bulk EDI Format Tab ──────────────────────────────
-            if carton_rows:
-                with tabs[tab_idx]:
-                    df_carton = pd.DataFrame(carton_rows)
-                    for col in CARTON_COLUMN_ORDER:
-                        if col not in df_carton.columns:
-                            df_carton[col] = ""
-                    df_carton = df_carton[CARTON_COLUMN_ORDER].astype(str).replace("nan", "")
-                    
-                    # Barcode duplicate ඉවත් කිරීම
-                    df_carton = df_carton.drop_duplicates(subset=['Carton Barcode'], keep='first')
+                        else:
+                            values, rotated_img = decode_page_barcodes(fdoc[i])
+                            barcode, gtin = pick_carton_and_gtin(values)
+                            if not barcode:
+                                if total_pages:
+                                    progress.progress((i + 1) / total_pages)
+                                continue
+                            row = parse_carton_ocr(rotated_img, i + 1)
+                            ew, eh = EXPECTED_CANVAS
+                            rw, rh = rotated_img.size
+                            if abs(rw - ew) / ew < 0.03 and abs(rh - eh) / eh < 0.03:
+                                row["Grid / Ref No."] = ocr_corner_number(rotated_img)
+                            else:
+                                row["Grid / Ref No."] = ""
+                            carton_no, carton_seq = split_carton_barcode(barcode)
+                            row["Carton Barcode"] = barcode
+                            row["Carton No."] = carton_no
+                            row["Carton Seq"] = carton_seq
+                            if gtin:
+                                row["GTIN (01)"] = gtin
+                            row["File"] = uf.name
+                            row["Format"] = "OCR"
+                            file_ocr_rows.append(row)
+                            ocr_pages_processed += 1
 
-                    total_cartons = len(df_carton)
-                    total_qty = sum(int(q) for q in df_carton["Qty"] if str(q).isdigit())
+                        if total_pages:
+                            progress.progress((i + 1) / total_pages)
 
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("මුළු Cartons (Unique)", f"{total_cartons:,}")
-                    c2.metric("මුළු Qty", f"{total_qty:,}")
-                    c3.metric("අඩංගු ගොනු ගණන", len(uploaded_files))
+                    progress.empty()
 
-                    st.success(f"✅ Carton/Bulk EDI හි ලේබල් {total_cartons:,} ක් සාර්ථකව හඳුනා ගන්නා ලදී!")
-                    st.dataframe(df_carton, use_container_width=True, height=400)
+                    file_ocr_rows = apply_batch_mode_correction(file_ocr_rows)
+                    carton_rows.extend(file_ocr_rows)
 
-                    summary = (
-                        df_carton.assign(_q=pd.to_numeric(df_carton["Qty"], errors="coerce").fillna(0).astype(int))
-                          .groupby(["Ship To", "PO #", "Style / Color", "Color", "Size"], as_index=False)
-                          .agg(**{"Cartons": ("_q", "size"), "Total Qty": ("_q", "sum")})
-                    )
-                    summary["Total Qty"] = summary["Total Qty"].astype(str)
-                    summary["Cartons"]   = summary["Cartons"].astype(str)
+        # ── Carton-label rows ─────────────────────────────────────────────
+        if carton_rows:
+            df = pd.DataFrame(carton_rows)
+            for col in CARTON_COLUMN_ORDER:
+                if col not in df.columns:
+                    df[col] = ""
+            df = df[CARTON_COLUMN_ORDER].astype(str).replace("nan", "")
 
-                    with st.expander("📋 Cartons සාරාංශය (Summary)"):
-                        st.dataframe(summary, use_container_width=True)
+            before = len(df)
+            has_barcode = df["Carton Barcode"] != ""
+            dup_mask = has_barcode & df.duplicated(subset=["Carton Barcode"], keep="first")
+            dup_df = df[dup_mask].copy()
+            df = df[~dup_mask].reset_index(drop=True)
+            removed = before - len(df)
 
-                    excel_carton = build_excel(df_carton, CARTON_COL_WIDTHS, summary_df=summary, highlight_mixed=False)
-                    st.download_button(
-                        label="📥 Download Carton Master Excel Report",
-                        data=excel_carton,
-                        file_name="Carton_Bulk_EDI_Report.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-                tab_idx += 1
+            total_cartons = len(df)
+            total_qty = sum(int(q) for q in df["Qty"] if str(q).isdigit())
 
-            # ── 2. CMUS EDI Format Tab ─────────────────────────────────────────
-            if cmus_rows:
-                with tabs[tab_idx]:
-                    df_cmus = pd.DataFrame(cmus_rows)
-                    df_cmus = merge_sscc_groups(df_cmus)
-                    for col in CMUS_COLUMN_ORDER:
-                        if col not in df_cmus.columns:
-                            df_cmus[col] = ""
-                    df_cmus = df_cmus[CMUS_COLUMN_ORDER].astype(str).replace("nan", "")
-                    
-                    # SSCC Duplicate ඉවත් කිරීම
-                    df_cmus = df_cmus.drop_duplicates(subset=['SSCC (digits)'], keep='first')
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("මුළු Cartons (unique)", f"{total_cartons:,}")
+            c2.metric("මුළු Qty", f"{total_qty:,}")
+            c3.metric("Duplicate barcodes ඉවත් කළ ගණන", f"{removed:,}")
+            c4.metric("OCR කළ Pages ගණන", f"{ocr_pages_processed:,}")
 
-                    total_labels = len(df_cmus)
-                    
-                    c1, c2 = st.columns(2)
-                    c1.metric("මුළු CMUS Labels (Unique)", f"{total_labels:,}")
-                    c2.metric("අඩංගු ගොනු ගණන", len(uploaded_files))
+            st.success(f"✅ Cartons {total_cartons:,} ක දත්ත සාර්ථකව හඳුනා ගන්නා ලදී!")
+            if removed:
+                st.warning(f"⚠️ Duplicate barcode තිබූ carton {removed:,} ක් master file එකෙන් ඉවත් කරන ලදී.")
+            needs_review_count = (df["Needs Review"] == "Yes").sum()
+            if needs_review_count:
+                st.info(
+                    f"ℹ️ OCR කළ carton {needs_review_count:,} ක field කිහිපයක් batch එකේ අනෙක් "
+                    f"cartons වලට වඩා වෙනස් වූ නිසා, review කිරීම සඳහා 'Needs Review' කර ඇත "
+                    f"(Excel එකේ රතු පාටින් highlight වේ)."
+                )
+            st.dataframe(df, use_container_width=True, height=420)
 
-                    st.success(f"✅ CMUS EDI හි ලේබල් {total_labels:,} ක් සාර්ථකව හඳුනා ගන්නා ලදී!")
-                    st.dataframe(df_cmus, use_container_width=True, height=400)
+            summary = (
+                df.assign(_q=pd.to_numeric(df["Qty"], errors="coerce").fillna(0).astype(int))
+                  .groupby(["File", "Ship To", "PO #", "Style / Color", "Color", "Size"], as_index=False)
+                  .agg(**{"Cartons": ("_q", "size"), "Total Qty": ("_q", "sum")})
+            )
+            summary["Total Qty"] = summary["Total Qty"].astype(str)
+            summary["Cartons"] = summary["Cartons"].astype(str)
 
-                    excel_cmus = build_excel(df_cmus, CMUS_COL_WIDTHS, highlight_mixed=True)
-                    st.download_button(
-                        label="📥 Download CMUS Master Excel Report",
-                        data=excel_cmus,
-                        file_name="CMUS_EDI_Report.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
+            with st.expander("📋 සාරාංශය (Summary)"):
+                st.dataframe(summary, use_container_width=True)
 
-        else:
-            st.warning("Upload කරන ලද PDF ගොනුවලින් දත්ත හඳුනා ගත නොහැකි විය.")
+            if not dup_df.empty:
+                with st.expander(f"🗑️ ඉවත් කළ Duplicate Cartons ({len(dup_df)})"):
+                    st.dataframe(dup_df, use_container_width=True)
+
+            excel_bytes = build_excel(
+                df, CARTON_COL_WIDTHS, summary_df=summary,
+                highlight_mixed=True, dup_df=dup_df,
+            )
+            st.download_button(
+                label="📥 Download Master Excel File",
+                data=excel_bytes,
+                file_name="Carton_Master_Report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        # ── CMUS format ───────────────────────────────────────────────────
+        if cmus_rows:
+            df2 = pd.DataFrame(cmus_rows)
+            df2 = merge_sscc_groups(df2)
+            for col in CMUS_COLUMN_ORDER:
+                if col not in df2.columns:
+                    df2[col] = ""
+            df2 = df2[CMUS_COLUMN_ORDER].astype(str).replace("nan", "")
+
+            before2 = len(df2)
+            has_sscc = df2["SSCC (digits)"] != ""
+            dup_mask2 = has_sscc & df2.duplicated(subset=["SSCC (digits)"], keep="first")
+            df2 = df2[~dup_mask2].reset_index(drop=True)
+            removed2 = before2 - len(df2)
+
+            total_labels = df2["Carton No."].nunique()
+            st.success(
+                f"✅ CMUS ලේබල් {total_labels} ක දත්ත (පේළි {len(df2)}) සාර්ථකව හඳුනා ගන්නා ලදී!"
+            )
+            if removed2:
+                st.warning(f"⚠️ Duplicate SSCC තිබූ පේළි {removed2:,} ක් ඉවත් කරන ලදී.")
+            st.dataframe(df2, use_container_width=True)
+
+            excel_bytes2 = build_excel(df2, CMUS_COL_WIDTHS, highlight_mixed=True)
+            st.download_button(
+                label="📥 Download CMUS Master Excel File",
+                data=excel_bytes2,
+                file_name="Shipping_Master_Report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        if not carton_rows and not cmus_rows:
+            st.warning("PDF එකෙන් දත්ත හඳුනා ගත නොහැකි විය. (Format එක support නොකරයි)")
 
     except Exception as e:
         st.error(f"දෝෂයක් සිදුවිය: {e}")
         raise
 
 st.markdown("---")
-st.caption("© 2024 AI Shipping Tool | Developed by **Lakshan**")
+st.caption("© 2026 AI Shipping Tool | Developed by **Ishanka Madusanka**")
