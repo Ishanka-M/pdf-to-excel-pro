@@ -295,14 +295,25 @@ FIELD_BOXES = {
 EXPECTED_CANVAS = (4752, 3672)
 
 
-def ocr_field(rotated_img, box, whitelist="", psm=7, scale=2):
+def ocr_field(rotated_img, box, whitelist="", psm=7, scale=2, retry_psms=(8, 13, 6)):
     w, h = rotated_img.size
     x0, y0, x1, y1 = box
     crop = rotated_img.crop((max(0, x0), max(0, y0), min(w, x1), min(h, y1)))
     crop = crop.resize((crop.width * scale, crop.height * scale))
     gray = ImageOps.autocontrast(crop.convert("L"))
     wl = f"-c tessedit_char_whitelist={whitelist}" if whitelist else ""
-    return pytesseract.image_to_string(gray, config=f"--psm {psm} {wl}").strip()
+    txt = pytesseract.image_to_string(gray, config=f"--psm {psm} {wl}").strip()
+    if txt:
+        return txt
+    # Digit-only fields are small and occasionally come back empty under the
+    # default PSM depending on the tesseract build/version — retry with a
+    # few alternative page-segmentation modes before giving up.
+    if whitelist:
+        for alt_psm in retry_psms:
+            txt = pytesseract.image_to_string(gray, config=f"--psm {alt_psm} {wl}").strip()
+            if txt:
+                return txt
+    return ""
 
 
 def ocr_label_text(rotated_img):
@@ -317,16 +328,11 @@ def ocr_corner_number(rotated_img):
     The top-right corner of this label carries a small reference number
     (e.g. '880') with no printed label of its own. Verified via pixel blob
     analysis to sit at this exact position when rendered at zoom=6 and
-    rotated -90. Tries a couple of PSM modes since single-digit values are
-    occasionally missed by the default single-line mode.
+    rotated -90.
     """
     w, h = rotated_img.size
     box = (w - 194, 46, w - 59, 110)
-    for psm in (7, 8, 13):
-        txt = ocr_field(rotated_img, box, whitelist="0123456789", psm=psm, scale=4)
-        if txt:
-            return txt
-    return ""
+    return ocr_field(rotated_img, box, whitelist="0123456789", psm=7, scale=4)
 
 
 def parse_carton_ocr_precise(rotated_img, page_no):
@@ -423,7 +429,10 @@ def parse_carton_ocr_fallback(text, page_no):
 
 
 def parse_carton_ocr(rotated_img, page_no):
-    if rotated_img.size == EXPECTED_CANVAS:
+    w, h = rotated_img.size
+    ew, eh = EXPECTED_CANVAS
+    close_enough = abs(w - ew) / ew < 0.03 and abs(h - eh) / eh < 0.03
+    if close_enough:
         return parse_carton_ocr_precise(rotated_img, page_no)
     return parse_carton_ocr_fallback(ocr_label_text(rotated_img), page_no)
 
@@ -717,7 +726,12 @@ if uploaded_files:
                                     progress.progress((i + 1) / total_pages)
                                 continue
                             row = parse_carton_ocr(rotated_img, i + 1)
-                            row["Grid / Ref No."] = ocr_corner_number(rotated_img)
+                            ew, eh = EXPECTED_CANVAS
+                            rw, rh = rotated_img.size
+                            if abs(rw - ew) / ew < 0.03 and abs(rh - eh) / eh < 0.03:
+                                row["Grid / Ref No."] = ocr_corner_number(rotated_img)
+                            else:
+                                row["Grid / Ref No."] = ""
                             carton_no, carton_seq = split_carton_barcode(barcode)
                             row["Carton Barcode"] = barcode
                             row["Carton No."] = carton_no
