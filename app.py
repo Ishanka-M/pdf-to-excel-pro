@@ -340,7 +340,11 @@ def parse_carton_ocr_precise(rotated_img, page_no):
     pre-located box rather than parsed out of noisy full-page text. Verified
     100% accurate across every field on this label template."""
     ship_dc_raw = ocr_field(rotated_img, FIELD_BOXES["ship_dc"])
-    ship_city = ocr_field(rotated_img, FIELD_BOXES["ship_city"])
+    ship_city_raw = ocr_field(rotated_img, FIELD_BOXES["ship_city"])
+    # Keep only the clean "CITY ST" pattern — the crop's right edge sits close
+    # to the RFID box border, which is occasionally misread as a stray "|".
+    m = re.search(r'([A-Z]{2,}(?:\s[A-Z]{2,})?)\s+([A-Z]{2})\b', ship_city_raw)
+    ship_city = f"{m.group(1)} {m.group(2)}" if m else clean_text(ship_city_raw)
     # The DC-name OCR (ship_dc_raw) occasionally misreads a leading letter
     # (e.g. 'M' -> 'V'). The city name portion of "MCDONOUGH GA" reads
     # cleanly, and the DC name is always the same word + " DC", so reuse the
@@ -367,7 +371,9 @@ def parse_carton_ocr_precise(rotated_img, page_no):
 
     color = clean_text(ocr_field(rotated_img, FIELD_BOXES["color"]))
 
-    size = clean_text(ocr_field(rotated_img, FIELD_BOXES["size"]))
+    size_raw = ocr_field(rotated_img, FIELD_BOXES["size"])
+    m = re.search(r'([A-Z]{1,4})\D{0,3}(\d{2})', size_raw)
+    size = f"{m.group(1)} {m.group(2)}" if m else clean_text(size_raw)
 
     return {
         "Label No.": page_no,
